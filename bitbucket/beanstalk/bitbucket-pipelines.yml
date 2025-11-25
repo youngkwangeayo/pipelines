@@ -1,0 +1,41 @@
+image: atlassian/default-image:latest
+
+pipelines:
+  branches:
+    master:
+      - step: 
+          name: Deploy to AWS Elastic Beanstalk
+          deployment: production
+          script:
+            - apt-get update && apt-get install -y zip
+            - zip -r deployment-package.zip .
+
+            - pipe: atlassian/aws-elasticbeanstalk-deploy:1.1.1
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: "ap-northeast-2"
+                APPLICATION_NAME: "nextpay-kiosk"
+                ENVIRONMENT_NAME: "nextpay-kiosk"
+                ZIP_FILE: "deployment-package.zip"
+                S3_BUCKET : "bitbucket-nextpay"
+
+    # dev:
+    #   - step:
+    #       name: Deploy to AWS Elastic Beanstalk
+    #       deployment: production
+    #       script:
+    #         - apt-get update && apt-get install -y zip
+    #         - zip -r deployment-package.zip .
+
+    #         - pipe: atlassian/aws-elasticbeanstalk-deploy:1.1.1
+    #           variables:
+    #             AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+    #             AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+    #             AWS_DEFAULT_REGION: "ap-northeast-2"
+    #             APPLICATION_NAME: "nextpay-kiosk-dev"
+    #             ENVIRONMENT_NAME: "nextpay-kiosk-dev"
+    #             ZIP_FILE: "deployment-package.zip"
+    #             S3_BUCKET : "bitbucket-nextpay"
+
+

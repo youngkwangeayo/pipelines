@@ -1,0 +1,69 @@
+
+image: atlassian/default-image:2
+
+pipelines:
+  tags:
+    "*.*.*":
+      - step:
+          name: Build docker image
+          services:
+            - docker
+          script:
+            # AWS CLI 설치
+            - apt-get update && apt-get install -y awscli
+
+            # AWS CLI 버전 확인
+            - aws --version
+
+            # AWS 인증 설정
+            - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+            - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+            - aws configure set region $AWS_DEFAULT_REGION
+
+            # ECR 로그인
+            - aws ecr get-login-password | docker login --username AWS --password-stdin 365485194891.dkr.ecr.ap-northeast-2.amazonaws.com
+
+            # 버전 정보 파일 생성
+            - echo "{\"version\":\"$BITBUCKET_TAG\"}" > version.json
+
+            # Docker 이미지 빌드
+            - docker build -t $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG .
+
+            # Docker 이미지 태그 지정
+            - docker tag $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG 365485194891.dkr.ecr.ap-northeast-2.amazonaws.com/$BITBUCKET_REPO_SLUG:$BITBUCKET_TAG
+            - docker tag $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG 365485194891.dkr.ecr.ap-northeast-2.amazonaws.com/$BITBUCKET_REPO_SLUG:latest
+            # Docker 이미지 ECR에 푸시
+            - docker push 365485194891.dkr.ecr.ap-northeast-2.amazonaws.com/$BITBUCKET_REPO_SLUG:$BITBUCKET_TAG
+            - docker push 365485194891.dkr.ecr.ap-northeast-2.amazonaws.com/$BITBUCKET_REPO_SLUG:latest
+      - step:
+          name: Trigger k8s deploy pipe
+          script:
+            
+            - |
+              curl -sS -D - \
+                -H "Authorization: Bearer $K8S_API_TOKEN" \
+                -H "Content-Type: application/json" \
+                -X POST "https://api.bitbucket.org/2.0/repositories/$K8S_REPO/pipelines/" \
+                -d "{
+                  \"target\": {
+                    \"type\": \"pipeline_ref_target\",
+                    \"ref_type\": \"branch\",
+                    \"ref_name\": \"main\",
+                    \"selector\": { \"type\": \"custom\", \"pattern\": \"deploy-app\" }
+                  },
+                  \"variables\": [
+                    { \"key\": \"APP_NAME\", \"value\": \"aiagent\" },
+                    { \"key\": \"IMAGE_TAG\", \"value\": \"$BITBUCKET_TAG\" },
+                    { \"key\": \"ENV\", \"value\": \"dev\" }
+                  ]
+                }"
+            # - pipe: atlassian/trigger-pipeline:5.10.1
+            #   variables:
+            #     BITBUCKET_ACCESS_TOKEN: $K8S_API_TOKEN
+            #     REPOSITORY: $K8S_REPO
+            #     REF_TYPE: "branch"
+            #     REF_NAME: "main"
+            #     CUSTOM_PIPELINE_NAME: "deploy-app"
+            #     PIPELINE_VARIABLES: >
+            #       [{ "key": "APP_NAME",  "value": "aiagent" },{ "key": "IMAGE_TAG", "value": $BITBUCKET_TAG },{"key":"ENV","value":"dev"}]
+            #     WAIT: "true"

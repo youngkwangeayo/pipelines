@@ -1,0 +1,136 @@
+#  ==============  레포지토리 환경 변수  ==============
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,  AWS_DEFAULT_REGION       # CLI
+#   AWS_ECR_REPO, AWS_ECR_NAME                                          # ECR 라이브
+#   AWS_ECR_REPO_DEV, AWS_ECR_NAME_DEV                                  # ECR 데브
+#   AWS_TASK_DEFINITION, AWS_ECS_CLUSTER, AWS_ECS_SERVICE               # ECS 라이브
+#   AWS_TASK_DEFINITION_DEV, AWS_ECS_CLUSTER_DEV, AWS_ECS_SERVICE_DEV   # ECS 데브
+# =================================================
+#  내용
+# =================================================
+image: atlassian/default-image:2
+
+pipelines:
+  tags:
+    '*.*.*-dev-*':
+      - step:
+          name: 🏗️ Build & Push Image to ECR (DEV)
+          services:
+            - docker
+          script:
+            # Docker 이미지 빌드
+            - TARGET_VERSION=$BITBUCKET_TAG
+            - docker build -t $AWS_ECR_NAME_DEV:$TARGET_VERSION -t $AWS_ECR_NAME_DEV .
+            # ECR에 REPO 태그 지정
+            - docker tag $AWS_ECR_NAME_DEV:$TARGET_VERSION $AWS_ECR_REPO_DEV/$AWS_ECR_NAME_DEV:$TARGET_VERSION
+            - docker tag $AWS_ECR_NAME_DEV:$TARGET_VERSION $AWS_ECR_REPO_DEV/$AWS_ECR_NAME_DEV:latest
+            # ECR에 푸시
+            - pipe: atlassian/aws-ecr-push-image:2.6.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID 
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION 
+                IMAGE_NAME: $AWS_ECR_NAME_DEV
+                TAGS: "$TARGET_VERSION latest"
+      - parallel:
+        - step:
+            name: 🚀 Deploy to ECS (DEV)
+            image: amazon/aws-cli:2.30.3
+            script:
+              # 레포환경변수 export 및 dev 재할당 _ 스크립트 재사용 위해
+              - export TARGET_VERSION=$BITBUCKET_TAG
+              - export AWS_TASK_DEFINITION=$AWS_TASK_DEFINITION_DEV
+              - export AWS_ECS_CLUSTER=$AWS_ECS_CLUSTER_DEV
+              - export AWS_ECS_SERVICE=$AWS_ECS_SERVICE_DEV
+              - export AWS_ECR_REPO=$AWS_ECR_REPO_DEV
+              - export AWS_ECR_NAME=$AWS_ECR_NAME_DEV
+
+              # TODO URL 중복 덮어쓰기. 추후 terraform+ecs 환경으로 확정되면 그떄 빼기
+              - echo "CMS_URL=https://dev-cms.nextpay.co.kr" >> .env.dev
+              
+              - chmod +x ./infra/convert-env-to-awsjson.sh ./infra/pipe-task-reversion.sh
+
+              # Reversion & deploy
+              - source ./infra/pipe-task-reversion.sh ./infra/convert-env-to-awsjson.sh .env.dev
+
+              - aws ecs update-service --cluster $AWS_ECS_CLUSTER --service $AWS_ECS_SERVICE --task-definition $AWS_TASK_DEFINITION:$NEW_REVISION --force-new-deployment
+              - echo "ECS await provisioning..."
+              
+              - aws ecs wait services-stable --cluster $AWS_ECS_CLUSTER --services $AWS_ECS_SERVICE
+              - echo "✅ ECS deployment completed successfully!"
+        - step:
+            name: 🚀[Cron] Deploy to ECS (DEV)
+            image: amazon/aws-cli:2.30.3
+            script:
+              # 레포환경변수 export 및 dev 재할당 _ 스크립트 재사용 위해
+              - export TARGET_VERSION=$BITBUCKET_TAG
+              - export AWS_TASK_DEFINITION=$AWS_TASK_DEFINITION_DEV-cron
+              - export AWS_ECS_SERVICE=$AWS_ECS_SERVICE_DEV-cron
+              - export AWS_ECS_CLUSTER=$AWS_ECS_CLUSTER_DEV
+              - export AWS_ECR_REPO=$AWS_ECR_REPO_DEV
+              - export AWS_ECR_NAME=$AWS_ECR_NAME_DEV
+
+              # TODO URL 중복 덮어쓰기. 추후 terraform+ecs 환경으로 확정되면 그떄 빼기
+              - echo "CMS_URL=https://dev-cms.nextpay.co.kr" >> .env.dev
+              - echo "CRON=ENABLE" >> .env.dev
+              
+              - chmod +x ./infra/convert-env-to-awsjson.sh ./infra/pipe-task-reversion.sh
+
+              # Reversion & deploy
+              - source ./infra/pipe-task-reversion.sh ./infra/convert-env-to-awsjson.sh .env.dev
+
+              - aws ecs update-service --cluster $AWS_ECS_CLUSTER --service $AWS_ECS_SERVICE --task-definition $AWS_TASK_DEFINITION:$NEW_REVISION --force-new-deployment
+              - echo "ECS await provisioning..."
+              
+              - aws ecs wait services-stable --cluster $AWS_ECS_CLUSTER --services $AWS_ECS_SERVICE
+              - echo "✅ ECS deployment completed successfully!"
+    '*.*.*':
+        - step:
+            name: 🏗️ Build & Push Image to ECR (PROD)
+            services:
+              - docker
+            script:
+              # Docker 이미지 빌드
+              - TARGET_VERSION=$BITBUCKET_TAG
+              - docker build -t $AWS_ECR_NAME:$TARGET_VERSION -t $AWS_ECR_NAME .
+              # ECR에 REPO 태그 지정
+              - docker tag $AWS_ECR_NAME:$TARGET_VERSION $AWS_ECR_REPO/$AWS_ECR_NAME:$TARGET_VERSION
+              - docker tag $AWS_ECR_NAME:$TARGET_VERSION $AWS_ECR_REPO/$AWS_ECR_NAME:latest
+              # ECR에 푸시
+              - pipe: atlassian/aws-ecr-push-image:2.6.0
+                variables:
+                  AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID 
+                  AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                  AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION 
+                  IMAGE_NAME: $AWS_ECR_NAME
+                  TAGS: "$TARGET_VERSION latest"
+        - parallel:
+          - step:
+              name: 🚀 Deploy to ECS (PROD)
+              image: amazon/aws-cli:2.30.3
+              script:
+                - export TARGET_VERSION=$BITBUCKET_TAG
+                - chmod +x ./infra/convert-env-to-awsjson.sh ./infra/pipe-task-reversion.sh
+
+                # Reversion & deploy
+                - source ./infra/pipe-task-reversion.sh ./infra/convert-env-to-awsjson.sh .env.prod
+
+                - echo "It's not fully complete. Go into AWS console ECS and deploy the relevant revision $NEW_REVISION"
+          - step:
+              name: 🚀[Cron] Deploy to ECS (PROD)
+              image: amazon/aws-cli:2.30.3
+              script:
+                 # 레포환경변수 export 및 cron 재할당 _ 스크립트 재사용 위해
+                - export AWS_TASK_DEFINITION=$AWS_TASK_DEFINITION-cron
+                - export AWS_ECS_SERVICE=$AWS_ECS_SERVICE-cron
+                - export TARGET_VERSION=$BITBUCKET_TAG
+                
+                - echo "CRON=ENABLE" >> .env.prod
+
+                - chmod +x ./infra/convert-env-to-awsjson.sh ./infra/pipe-task-reversion.sh
+
+                # Reversion & deploy
+                - source ./infra/pipe-task-reversion.sh ./infra/convert-env-to-awsjson.sh .env.prod
+
+                - echo "It's not fully complete. Go into AWS console ECS and deploy the relevant revision $NEW_REVISION"
+
+                

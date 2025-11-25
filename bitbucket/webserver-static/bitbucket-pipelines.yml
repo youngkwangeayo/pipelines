@@ -1,0 +1,72 @@
+# 환경추가 AWS_ACCESS_KEY_ID , AWS_SECRET_ACCESS_KEY,  AWS_DEFAULT_REGION,  SSH_USER ,SERVER , SSH_KEY, ECR_PATH
+
+image: node:22
+
+pipelines:
+  tags:
+    # "server_*.*.*":
+    #   - parallel:
+    #       - step:
+    #           name: Build dev react
+    #           caches:
+    #             - node
+    #           script:
+    #             #-이미지를 빌드시킵니다.
+    #             - docker build -t nds:$BITBUCKET_TAG .
+
+    #             #이미지를 ecr에 푸쉬합니다.
+    #             - pipe: atlassian/aws-ecr-push-image:2.5.0
+    #               variables:
+    #                 AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID # aws 억세스 키 (iam user)
+    #                 AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY # aws 억세스 키 (iam user)
+    #                 AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION # aws 사용할리전
+    #                 IMAGE_NAME: nds # pipe 에서 알아서 url 을 찾음 name 이면됨.
+    #                 TAGS: $BITBUCKET_TAG #이미지 태그_ 버전
+
+    #             - ssh $SSH_USER@$SERVER sudo aws ecr get-login-password --region ap-northeast-2 | docker login --username AWS --password-stdin 365485194891.dkr.ecr.ap-northeast-2.amazonaws.com
+    #             # ssh 파이프를 이용해서 ec2에 접속합니다.
+    #             - ssh $SSH_USER@$SERVER sudo docker stop nds
+    #             - ssh $SSH_USER@$SERVER docker run -v /var/www/react_build:/usr/src/server_app/build -d --name nds -p 80:80 365485194891.dkr.ecr.ap-northeast-2.amazonaws.com/nds:$BITBUCKET_TAG
+    "*.*.*":
+      # parallel 안에 스텝은 병렬로 실행
+      - parallel:
+          - step:
+              name: Build dev react
+              caches:
+                - node
+              script:
+                # API 서버 주소를 내용으로 .env 파일 작성 _ 내용 동적할당 (레포지토리변수) ex) cms.dev / cms.service
+                # - echo $DEV_API_SERVER >> .env
+
+                # 1. 라이브러리및링커. 2. ci 환경에서 경고를 오류로 설정되는값이 있어 false 로 변경 후 빌드
+                - npm install
+                - CI=false npm run build
+                # 경로생성
+                - mkdir -p tmp-version
+                # 1. zip 파일 인스톨, 2. build 안의 내용 태그이름으로 zip 생성
+                - apt update && apt install -y zip
+                - cd build && zip -r ../tmp-version/nds_react_$BITBUCKET_TAG.zip ./* && cd ../
+
+                # ssh 로 디렉토리 생성
+                - ssh $SSH_USER@$SERVER mkdir -p /var/react_versions
+                # scp 로 파일전송. 권한때문에 user home에
+                - scp ./tmp-version/nds_react_$BITBUCKET_TAG.zip $SSH_USER@$SERVER:./
+
+                # zip 파일 풀어서 tmp 생성
+                - ssh $SSH_USER@$SERVER sudo unzip nds_react_$BITBUCKET_TAG.zip -d /var/www/react_build_tmp
+                # 파일 변경
+                - ssh $SSH_USER@$SERVER sudo rsync -a --delete /var/www/react_build_tmp/ /var/www/react_build/
+                # tmp 디렉토리삭제
+                - ssh $SSH_USER@$SERVER sudo rm -rf /var/www/react_build_tmp
+
+                # sudo 로 파일이동
+                - ssh $SSH_USER@$SERVER sudo mv ./nds_react_$BITBUCKET_TAG.zip /var/react_versions
+
+                # 추후 리엑트버전은 S3관리 
+                # - pipe: atlassian/aws-s3-deploy:1.1.0
+          #         variables:
+          #           AWS_ACCESS_KEY_ID: $NEW_AWS_ACCESS_KEY_ID
+          #           AWS_SECRET_ACCESS_KEY: $NEW_AWS_SECRET_ACCESS_KEY
+          #           AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+          #           S3_BUCKET: $DEV_S3_BUCKET_NAME/build-zip
+          #           LOCAL_PATH: tmp-version

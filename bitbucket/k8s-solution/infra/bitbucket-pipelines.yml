@@ -1,0 +1,38 @@
+
+image: atlassian/default-image:3
+
+pipelines:
+  custom:
+    deploy-app: # 커스텀파이프이름
+      - variables:  # 매개변수 
+          - name: APP_NAME  # appname = appname 과 디렉토리는 같음 
+            default: app1
+          - name: IMAGE_TAG # 베포할 버전
+            default: latest
+          - name: ENV # 릴리즈 환경 현재 dev만 사용.
+            default: dev
+      - step:
+          image: alpine/k8s:1.34.0
+          script:
+
+            - apt-get update && apt-get install -y awscli
+
+            # AWS 인증 설정
+            - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+            - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+            - aws configure set region $AWS_DEFAULT_REGION
+            
+            # AWS EKS 클러스터에 세팅
+            - aws eks update-kubeconfig --region $AWS_DEFAULT_REGION --name $EKS_DEV_CLUSTER_NAME
+
+            # 특정앱 특정 버전 helm 으로 베포.
+            - | 
+              helm upgrade --install $APP_NAME helm-charts/$APP_NAME/ \
+                -n $ENV-aiagent \
+                -f helm-charts/$APP_NAME/values.yaml \
+                -f helm-charts/$APP_NAME/values-$ENV.yaml \
+                --set image.tag=$IMAGE_TAG
+
+
+
+
