@@ -21,6 +21,7 @@ pipelines:
             default: dev
       - step:
           image: alpine/k8s:1.34.0
+          name: Deploy (DEV)
           script:
 
             - apt-get update && apt-get install -y awscli
@@ -50,7 +51,7 @@ pipelines:
           - name: ENV
             default: prod
       - step:
-          name: Generate Deploy Scripts
+          name: Generate Deploy Scripts (PROD)
           image: alpine/k8s:1.34.0
           script:
             # 필수 도구 설치
@@ -75,4 +76,15 @@ pipelines:
             - ./sh/makesh.sh $ENV $APP_NAME $IMAGE_TAG $CURRENT_REVISION
             - git add sh/
             - 'git commit -m "chore: update prod deploy scripts for $APP_NAME - $IMAGE_TAG"'
-            - git push origin $BITBUCKET_BRANCH
+            # - git push origin $BITBUCKET_BRANCH
+
+            - |
+              # 최대 5번 재시도하는 예시
+              n=0
+              until [ "$n" -ge 10 ]
+              do
+                git pull --rebase origin $BITBUCKET_BRANCH && git push origin $BITBUCKET_BRANCH && break
+                n=$((n+1))
+                echo "Push failed. Retrying in 3 seconds... (Attempt $n)"
+                sleep 1
+              done
