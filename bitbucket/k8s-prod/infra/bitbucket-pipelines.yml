@@ -1,0 +1,78 @@
+#  ==============  레포지토리 환경 변수  ==============
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,  AWS_DEFAULT_REGION       # CLI
+#   EKS_DEV_CLUSTER_NAME                                                # EKS 데브
+#   EKS_PROD_CLUSTER_NAME                                               # EKS 프로드
+#   GIT_EMAIL                                                           # GIT push 용
+# =================================================
+#  내용
+# =================================================
+
+image: atlassian/default-image:3
+
+pipelines:
+  custom:
+    deploy-app: # 커스텀파이프이름
+      - variables:  # 매개변수 
+          - name: APP_NAME  # appname = appname 과 디렉토리는 같음 
+            default: app1
+          - name: IMAGE_TAG # 베포할 버전
+            default: latest
+          - name: ENV # 릴리즈 환경 현재 dev만 사용.
+            default: dev
+      - step:
+          image: alpine/k8s:1.34.0
+          script:
+
+            - apt-get update && apt-get install -y awscli
+
+            # AWS 인증 설정
+            - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+            - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+            - aws configure set region $AWS_DEFAULT_REGION
+            
+            # AWS EKS 클러스터에 세팅
+            - aws eks update-kubeconfig --region $AWS_DEFAULT_REGION --name $EKS_DEV_CLUSTER_NAME
+
+            # 특정앱 특정 버전 helm 으로 베포.
+            - |
+              helm upgrade --install $APP_NAME helm-charts/$APP_NAME/ \
+                -n $ENV-cms \
+                -f helm-charts/$APP_NAME/values.yaml \
+                -f helm-charts/$APP_NAME/values-$ENV.yaml \
+                --set image.tag=$IMAGE_TAG
+
+    generate-prod: # prod 배포용 커스텀 파이프라인 - 스크립트 생성 후 git push
+      - variables:
+          - name: APP_NAME
+            default: cms
+          - name: IMAGE_TAG
+            default: latest
+          - name: ENV
+            default: prod
+      - step:
+          name: Generate Deploy Scripts
+          image: alpine/k8s:1.34.0
+          script:
+            # 필수 도구 설치
+            - apk add --no-cache aws-cli jq
+
+            # AWS 인증 설정
+            - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+            - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+            - aws configure set region $AWS_DEFAULT_REGION
+
+            # EKS 클러스터 연결
+            - aws eks update-kubeconfig --region $AWS_DEFAULT_REGION --name $EKS_PROD_CLUSTER_NAME
+
+            # 현재 리비전 조회 (없으면 0)
+            - CURRENT_REVISION=$(helm history $APP_NAME -n $ENV-cms -o json 2>/dev/null | jq -r '.[-1].revision' || echo "0")
+            - echo "Current revision is $CURRENT_REVISION"
+
+            # 스크립트 생성
+            - git config user.email "$GIT_EMAIL"
+            - git config user.name "Bitbucket Pipeline"
+            - chmod +x sh/makesh.sh
+            - ./sh/makesh.sh $ENV $APP_NAME $IMAGE_TAG $CURRENT_REVISION
+            - git add sh/
+            - 'git commit -m "chore: update prod deploy scripts for $APP_NAME - $IMAGE_TAG"'
+            - git push origin $BITBUCKET_BRANCH
