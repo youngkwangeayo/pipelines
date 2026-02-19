@@ -1,0 +1,170 @@
+#  ==============  레포지토리 환경 변수  ==============
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION   # AWS CLI
+#   GIT_EMAIL                                                       # Git push 용
+#   DEPLOY_USER                                                     # 원격 Swarm 매니저 SSH 유저
+#   DEV_DEPLOY_HOST                                                     # 원격 Swarm 매니저 SSH 호스트 (DEV)
+#   PROD_DEPLOY_USER                                                # 원격 Swarm 매니저 SSH 유저 (PROD)
+#   PROD_DEPLOY_HOST                                                # 원격 Swarm 매니저 SSH 호스트 (PROD)
+#   BASTION_USER                                                    # 배스천 서버 SSH 유저
+#   BASTION_HOST                                                    # 배스천 서버 SSH 호스트
+#  ==============  SSH 키 설정  ==============
+#   Repository Settings > SSH Keys 에서 키페어 등록 + Known hosts 추가
+#   (DEV 호스트, PROD 배스천, PROD 호스트 모두 Known hosts 등록 필요)
+#   ==============  API 토큰  ==============
+#   Expires:
+#   Feb 12, 2027
+#   =================================================
+
+image: atlassian/default-image:3
+
+pipelines:
+  custom:
+    # ════════════════════════════════════════
+    # DEV 배포
+    # ════════════════════════════════════════
+    deploy-app:
+      - variables:
+          - name: ENV
+            default: dev
+          - name: STACK
+            default: stack-name
+          - name: IMAGE_TAG
+            default: latest
+          - name: APP_NAME
+            default: app-name
+      # ── Step 1: version.env 업데이트 & Git Push ──
+      - step:
+          name: Update version.env & Push
+          script:
+          
+            # version.env 태그 업데이트
+            - sed -i "s/^${ENV}_${APP_NAME}_TAG.*/${ENV}_${APP_NAME}_TAG=$IMAGE_TAG/" ./infra/$STACK/version.env
+            - cat ./infra/$STACK/version.env
+
+            # Git 설정
+            - git config user.email "$GIT_EMAIL"
+            - git config user.name "Bitbucket Pipeline"
+
+            # 커밋 & Push
+            - git add ./infra/$STACK/version.env
+            - 'git commit -m "chore: update $APP_NAME $ENV tag to $IMAGE_TAG"'
+            - |
+              n=0
+              until [ "$n" -ge 10 ]; do
+                git pull --rebase origin $BITBUCKET_BRANCH && git push origin $BITBUCKET_BRANCH && break
+                n=$((n+1))
+                echo "Push failed. Retrying in 2s... (Attempt $n/10)"
+                sleep 2
+              done
+              if [ "$n" -ge 10 ]; then
+                echo "ERROR: Git push failed after 10 attempts"
+                exit 1
+              fi
+
+      # ── Step 2: Docker Swarm 배포 (원격 Docker Context) ──
+      - step:
+          # image: amazon/aws-cli:2.33.21
+          image: docker:29.2
+          services:
+          - docker
+          name: Deploy to Swarm (DEV)
+          script:
+            # 필요 도구 설치
+            - apk add --no-cache make aws-cli openssh-client
+            
+
+            - docker --version || echo "Docker not found"
+            - make --version || echo "Make not found"
+            - aws --version || echo "AWS CLI not found"
+
+
+            # SSH를 통한 원격 Docker Context 생성
+            - docker context create remote --docker "host=ssh://$DEV_DEPLOY_USER@$DEV_DEPLOY_HOST"
+            
+            - docker context ls
+            # 배포
+            - make init
+
+            - unset DOCKER_HOST
+            # SSH known_hosts 등록 (Host key verification 방지)
+            - mkdir -p ~/.ssh
+            - ssh-keyscan -H $DEV_DEPLOY_HOST >> ~/.ssh/known_hosts
+
+            - docker context use remote
+            - docker context ls
+            
+            - make deploy ENV=$ENV STACK=$STACK
+
+    # ════════════════════════════════════════
+    # PROD 배포 (배스천 경유)
+    # ════════════════════════════════════════
+    deploy-app-prod:
+      - variables:
+          - name: ENV
+            default: prod
+          - name: STACK
+            default: signage-manager
+          - name: IMAGE_TAG
+            default: latest
+          - name: APP_NAME
+            default: sm
+      # ── Step 1: version.env 업데이트 & Git Push ──
+      - step:
+          name: Update version.env & Push (PROD)
+          script:
+            # version.env 태그 업데이트
+            - sed -i "s/^${ENV}_${APP_NAME}_TAG=.*/${ENV}_${APP_NAME}_TAG=$IMAGE_TAG/" ./infra/$STACK/version.env
+            - cat ./infra/$STACK/version.env
+
+            # Git 설정
+            - git config user.email "$GIT_EMAIL"
+            - git config user.name "Bitbucket Pipeline"
+
+            # 커밋 & Push
+            - git add ./infra/$STACK/version.env
+            - 'git commit -m "chore: update $APP_NAME $ENV tag to $IMAGE_TAG"'
+            - |
+              n=0
+              until [ "$n" -ge 10 ]; do
+                git pull --rebase origin $BITBUCKET_BRANCH && git push origin $BITBUCKET_BRANCH && break
+                n=$((n+1))
+                echo "Push failed. Retrying in 2s... (Attempt $n/10)"
+                sleep 2
+              done
+              if [ "$n" -ge 10 ]; then
+                echo "ERROR: Git push failed after 10 attempts"
+                exit 1
+              fi
+
+      # ── Step 2: 배스천 경유 Docker Swarm 배포 ──
+      - step:
+          name: Deploy to Swarm (PROD via Bastion)
+          script:
+            # 필요 도구 설치
+            # - apt-get update && apt-get install -y make  # atlassian/default-image:3 기본 포함
+            - pip install awscli
+
+            # SSH config - 배스천 경유 ProxyJump 설정
+            - mkdir -p ~/.ssh
+            - |
+              cat >> ~/.ssh/config <<EOF
+              Host bastion
+                HostName $BASTION_HOST
+                User $BASTION_USER
+                StrictHostKeyChecking no
+
+              Host prod-swarm
+                HostName $PROD_DEPLOY_HOST
+                User $PROD_DEPLOY_USER
+                ProxyJump bastion
+                StrictHostKeyChecking no
+              EOF
+            - chmod 600 ~/.ssh/config
+
+            # 배스천 경유 원격 Docker Context 생성
+            - docker context create remote --docker "host=ssh://prod-swarm"
+            - docker context use remote
+
+            # 배포
+            - make init
+            - make deploy ENV=$ENV STACK=$STACK
