@@ -61,6 +61,9 @@ pipelines:
                 exit 1
               fi
 
+          artifacts:
+            - infra/**/version.env
+
       # ── Step 2: Docker Swarm 배포 (원격 Docker Context) ──
       - step:
           # image: amazon/aws-cli:2.33.21
@@ -71,19 +74,11 @@ pipelines:
           script:
             # 필요 도구 설치
             - apk add --no-cache make aws-cli openssh-client
-            
-
-            - docker --version || echo "Docker not found"
-            - make --version || echo "Make not found"
-            - aws --version || echo "AWS CLI not found"
-
 
             # SSH를 통한 원격 Docker Context 생성
             - docker context create remote --docker "host=ssh://$DEV_DEPLOY_USER@$DEV_DEPLOY_HOST"
             
             - docker context ls
-            # 배포
-            - make init
 
             - unset DOCKER_HOST
             # SSH known_hosts 등록 (Host key verification 방지)
@@ -93,6 +88,8 @@ pipelines:
             - docker context use remote
             - docker context ls
             
+            # 배포
+            - make init
             - make deploy ENV=$ENV STACK=$STACK
 
     # ════════════════════════════════════════
@@ -135,6 +132,9 @@ pipelines:
                 echo "ERROR: Git push failed after 10 attempts"
                 exit 1
               fi
+
+          artifacts:
+            - infra/**/version.env
 
       # ── Step 2: 배스천 경유 Docker Swarm 배포 ──
       - step:
