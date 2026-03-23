@@ -1,0 +1,94 @@
+#  ==============  레포지토리 환경 변수  ==============
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,  AWS_DEFAULT_REGION       # CLI
+#   AWS_ECR_REPO, AWS_ECR_NAME                                          # ECR 라이브
+#   K8S_REPO, K8S_API_TOKEN          GIT_EMAIL                          # K8S 라이브, 데브
+# =================================================
+#  내용
+# =================================================
+
+image: atlassian/default-image:5
+
+definitions:
+  services:
+    docker:
+      memory: 3072
+
+pipelines:
+  tags:
+    "dev-*.*.*":
+      - step:
+          name: Build and Push Docker Image to ECR
+          services:
+            - docker
+          script:
+
+            # buildx 끄기 (고전 빌더 사용)
+            - export DOCKER_BUILDKIT=0 ## atlassian/default-image:2로 할 경우엔 주석
+
+            # dev- 프리픽스 제거
+            - export BITBUCKET_TAG=${BITBUCKET_TAG#dev-}
+
+            - LOCAL_IMAGE=$BITBUCKET_REPO_SLUG:$BITBUCKET_TAG
+
+            # 버전 정보 파일 생성
+            - echo "{\"version\":\"$BITBUCKET_TAG\"}" > version.json
+
+            # Docker 이미지 빌드
+            - docker build -t $LOCAL_IMAGE .
+            - docker tag $LOCAL_IMAGE $BITBUCKET_REPO_SLUG:latest
+
+            # ECR 로그인 및 이미지 푸시
+            - pipe: atlassian/aws-ecr-push-image:2.6.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                IMAGE_NAME: $BITBUCKET_REPO_SLUG
+                TAGS: '$BITBUCKET_TAG latest'
+      - step:
+            name: K8S REPO PUSH
+            script:
+              # dev- 프리픽스 제거
+              - export BITBUCKET_TAG=${BITBUCKET_TAG#dev-}
+
+              - git config --global user.email "$GIT_EMAIL"
+              - git config --global user.name "Bitbucket Pipeline"
+              - git clone https://x-token-auth:$K8S_API_TOKEN@bitbucket.org/$K8S_REPO.git k8s-dir
+              - cd k8s-dir
+
+              - sed -i "s/^\(\s*tag:\s*\).*/\1${BITBUCKET_TAG}/" ./helm-charts/aiagent-api/values-dev.yaml
+
+
+              - git add .
+              - 'git commit -m "chore: update aiagent-api dev image tag to $BITBUCKET_TAG"'
+              - |
+                n=0
+                until [ "$n" -ge 10 ]
+                do
+                  git pull --rebase origin main && git push origin main && break
+                  n=$((n+1))
+                  echo "Push failed. Retrying in 3 seconds... (Attempt $n)"
+                  sleep 1
+                done
+    "*.*.*":
+      - step:
+            name: K8S REPO PUSH
+            script:
+              - git config --global user.email "$GIT_EMAIL"
+              - git config --global user.name "Bitbucket Pipeline"
+              - git clone https://x-token-auth:$K8S_API_TOKEN@bitbucket.org/$K8S_REPO.git k8s-dir
+              - cd k8s-dir
+
+              - sed -i "s/^\(\s*tag:\s*\).*/\1${BITBUCKET_TAG}/" ./helm-charts/aiagent-api/values-prod.yaml
+              
+              - git add .
+              - 'git commit -m "chore: update aiagent-api dev image tag to $BITBUCKET_TAG"'
+              - |
+                n=0
+                until [ "$n" -ge 10 ]
+                do
+                  git pull --rebase origin main && git push origin main && break
+                  n=$((n+1))
+                  echo "Push failed. Retrying in 3 seconds... (Attempt $n)"
+                  sleep 1
+                done
