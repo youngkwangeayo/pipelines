@@ -1,0 +1,61 @@
+#  ==============  레포지토리 환경 변수  ==============
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,  AWS_DEFAULT_REGION       # CLI
+#   S3_BUCKET_NAME                                                      # S3
+
+# =================================================
+#  내용
+# =================================================
+
+image: atlassian/default-image:5
+
+pipelines:
+  tags:
+    "*.*.*":
+      # parallel 안에 스텝은 병렬로 실행
+      - parallel:
+        # 데브에 버전 빌드
+        - step:
+            name: Build ZIP
+            script:
+
+
+              # 경로생성
+              - mkdir -p build-version
+              # 1. zip 파일 인스톨, 2. build 안의 내용 태그이름으로 zip 생성
+              - apt update && apt install -y zip
+
+
+              - zip -r build-version/debug-$BITBUCKET_TAG.zip debug/
+              - zip -r build-version/release-$BITBUCKET_TAG.zip release/
+
+
+              # S3에 build-zip 디렉토리안에 zip 파일 생성
+              - pipe: atlassian/aws-s3-deploy:1.1.0
+                variables:
+                  AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                  AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                  AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                  S3_BUCKET: $S3_BUCKET_NAME/signage_manager/build-version
+                  LOCAL_PATH: build-version
+        - step:
+            name: debug Upload
+            script:
+
+              - pipe: atlassian/aws-s3-deploy:1.1.0
+                variables:
+                  AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                  AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                  AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                  S3_BUCKET: $S3_BUCKET_NAME/signage_manager/templates/debug
+                  LOCAL_PATH: debug
+        - step:
+            name: release Upload
+            script:
+
+              - pipe: atlassian/aws-s3-deploy:1.1.0
+                variables:
+                  AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                  AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                  AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                  S3_BUCKET: $S3_BUCKET_NAME/signage_manager/templates/release
+                  LOCAL_PATH: release
