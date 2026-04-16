@@ -1,0 +1,52 @@
+image: golang:1.22
+
+pipelines:
+  # =============  CI: main 브랜치  =============
+  branches:
+    main:
+      - step:
+          name: CI - Build
+          script:
+            # - go build -v ./...
+            - echo "CI - Build 완료"
+      - step:
+          name: CI - Test
+          script:
+            # - go test -v ./...
+            - echo "CI - Test 완료"
+      - step:
+          name: CI - IMG Build END RUN
+          script:
+            # - go test -v ./...
+            - echo "CI - IMG Build END RUN "
+
+  pull-requests:
+    main:
+      - step:
+          name: CI - PR Build
+          script:
+            # - go build -v ./...
+            - echo "CI - PR Build 완료"
+      - step:
+          name: CI - PR Test
+          script:
+            # - go test -v ./...
+            - echo "CI - PR Test 완료"
+      - step:
+          name: CI - IMG Build END RUN
+          script:
+            # - go test -v ./...
+            - echo "CI - IMG Build END RUN "
+
+  # =============  CD: 태그 기반 배포  =============
+  tags:
+    '*.*.*':
+      - step:
+          name: CD - Build & Push
+          script:
+            # - go build -v ./...
+            - echo "CD - Build & Push on tag ${BITBUCKET_TAG}"
+      - step:
+          name: CD - Deploy
+          script:
+            - echo "CD - Deploy on tag ${BITBUCKET_TAG}"

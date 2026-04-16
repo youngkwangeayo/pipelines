@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  GO_VERSION: "1.22"
+
+jobs:
+  # =============  CI: main 브랜치 push  =============
+  build:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.22
+    steps:
+      - uses: actions/checkout@v4
+      - name: CI - Build
+        run: |
+          # go build -v ./...
+          echo "CI - Build 완료"
+
+  test:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.22
+    steps:
+      - uses: actions/checkout@v4
+      - name: CI - Test
+        run: |
+          # go test -v ./...
+          echo "CI - Test 완료"
+
+  img-build:
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.22
+    steps:
+      - uses: actions/checkout@v4
+      - name: CI - IMG Build END RUN
+        run: |
+          # go test -v ./...
+          echo "CI - IMG Build END RUN"
+
+  # =============  CI: PR  =============
+  pr-build:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.22
+    steps:
+      - uses: actions/checkout@v4
+      - name: CI - PR Build
+        run: |
+          # go build -v ./...
+          echo "CI - PR Build 완료"
+
+  pr-test:
+    if: github.event_name == 'pull_request'
+    needs: pr-build
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.22
+    steps:
+      - uses: actions/checkout@v4
+      - name: CI - PR Test
+        run: |
+          # go test -v ./...
+          echo "CI - PR Test 완료"
+
+  pr-img-build:
+    if: github.event_name == 'pull_request'
+    needs: pr-test
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.22
+    steps:
+      - uses: actions/checkout@v4
+      - name: CI - IMG Build END RUN
+        run: |
+          # go test -v ./...
+          echo "CI - IMG Build END RUN"

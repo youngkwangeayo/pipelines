@@ -1,0 +1,30 @@
+name: CD
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+
+jobs:
+  # =============  CD: 태그 기반 배포  =============
+  build-and-push:
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.22
+    steps:
+      - uses: actions/checkout@v4
+      - name: CD - Build & Push
+        run: |
+          # go build -v ./...
+          echo "CD - Build & Push on tag ${{ github.ref_name }}"
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.22
+    steps:
+      - uses: actions/checkout@v4
+      - name: CD - Deploy
+        run: |
+          echo "CD - Deploy on tag ${{ github.ref_name }}"
