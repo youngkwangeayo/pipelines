@@ -1,0 +1,101 @@
+#   ==============  레포지토리 환경 변수  ==============
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,  AWS_DEFAULT_REGION       # CLI
+#   AWS_ECR_REPO, AWS_ECR_NAME, AWS_ECR_NAME_DEV                        # ECR
+#   K8S_REPO, K8S_API_TOKEN, GIT_EMAIL                                  # DS 라이브, 데브
+#   =================================================
+#  내용 
+#   ============== INFRA API 토큰  ==============
+#   Expires: Mar 26, 2027
+#   =================================================
+image: atlassian/default-image:3
+
+pipelines:
+  tags:
+    'dev-*.*.*':
+      - step:
+          name: 🏗️ Build & Push Image to ECR (DEV)
+          services:
+            - docker
+          script:
+
+            - docker build --build-arg BUILD_ENV=development -t $AWS_ECR_NAME_DEV:$BITBUCKET_TAG -t $AWS_ECR_NAME_DEV .
+            # ECR에 REPO 태그 지정
+            - docker tag $AWS_ECR_NAME_DEV:$BITBUCKET_TAG $AWS_ECR_REPO/$AWS_ECR_NAME_DEV:$BITBUCKET_TAG
+            - docker tag $AWS_ECR_NAME_DEV:$BITBUCKET_TAG $AWS_ECR_REPO/$AWS_ECR_NAME_DEV:latest
+            # ECR에 푸시
+            - pipe: atlassian/aws-ecr-push-image:2.6.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID 
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION 
+                IMAGE_NAME: $AWS_ECR_NAME_DEV
+                TAGS: "$BITBUCKET_TAG latest"
+      - step:
+          name: K8S GIT PUSH (DEV)
+          script:
+            # 얌파싱 패키지 다운
+            - wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && chmod +x /usr/local/bin/yq
+                  
+                  
+            - git config --global user.email "$GIT_EMAIL"
+            - git config --global user.name "Bitbucket Pipeline"
+            - git clone https://x-token-auth:$K8S_API_TOKEN@bitbucket.org/$K8S_REPO.git k8s-dir
+            - cd k8s-dir
+
+            - yq e '.image.tag = env(BITBUCKET_TAG)' -i ./helm-charts/signage/sm/values-dev.yaml
+                  
+            - git add .
+            - 'git commit -m "chore: update sm-front dev image tag to $BITBUCKET_TAG"'
+            - |
+              n=0
+              until [ "$n" -ge 10 ]
+              do
+                git pull --rebase origin main && git push origin main && break
+                n=$((n+1))
+                echo "Push failed. Retrying in 3 seconds... (Attempt $n)"
+                sleep 1
+              done    
+    '*.*.*':
+      - step:
+          name: 🏗️ Build & Push Image to ECR (DEV)
+          services:
+            - docker
+          script:
+
+            - docker build --build-arg BUILD_ENV=production -t $AWS_ECR_NAME:$BITBUCKET_TAG -t $AWS_ECR_NAME .
+            # ECR에 REPO 태그 지정
+            - docker tag $AWS_ECR_NAME:$BITBUCKET_TAG $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+            - docker tag $AWS_ECR_NAME:$BITBUCKET_TAG $AWS_ECR_REPO/$AWS_ECR_NAME:latest
+            # ECR에 푸시
+            - pipe: atlassian/aws-ecr-push-image:2.6.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID 
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION 
+                IMAGE_NAME: $AWS_ECR_NAME
+                TAGS: "$BITBUCKET_TAG latest"
+      - step:
+          name: K8S GIT PUSH (PROD)
+          script:
+            # 얌파싱 패키지 다운
+            - wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && chmod +x /usr/local/bin/yq
+                
+                
+            - git config --global user.email "$GIT_EMAIL"
+            - git config --global user.name "Bitbucket Pipeline"
+            - git clone https://x-token-auth:$K8S_API_TOKEN@bitbucket.org/$K8S_REPO.git k8s-dir
+            - cd k8s-dir
+
+            - yq e '.image.tag = env(BITBUCKET_TAG)' -i ./helm-charts/signage/sm/values-prod.yaml
+                
+            - git add .
+            - 'git commit -m "chore: update sm-front prod image tag to $BITBUCKET_TAG"'
+            - |
+              n=0
+              until [ "$n" -ge 10 ]
+              do
+                git pull --rebase origin main && git push origin main && break
+                n=$((n+1))
+                echo "Push failed. Retrying in 3 seconds... (Attempt $n)"
+                sleep 1
+              done    
