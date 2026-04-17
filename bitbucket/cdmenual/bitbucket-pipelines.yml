@@ -1,0 +1,176 @@
+#   ==============  레포지토리 환경 변수  ==============
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,  AWS_DEFAULT_REGION       # CLI
+#   AWS_ECR_REPO, AWS_ECR_NAME, AWS_ECR_NAME_DEV                        # ECR
+#   DEPLOY_SSH_USER                                                     # EC2 SSH 사용자(공용)
+#   DEPLOY_SSH_HOST_DEV, DEPLOY_SSH_HOST_PROD                           # EC2 호스트 (IP/도메인)
+#
+#   =================================================
+#  내용
+#   ============== INFRA API 토큰  ==============
+#   Expires: Mar 26, 2027
+#   =================================================
+image: atlassian/default-image:5
+
+definitions:
+  steps:
+    # ── CI 공통 스텝 (YAML 앵커) ──
+    - step: &lint-audit
+        name: CI - Lint & Security Audit
+        image: node:20
+        caches:
+          - node
+        script:
+          - npm ci
+          - npm run lint
+          # - npm run {USER_TEST}
+
+    - step: &build
+        name: CI - Build
+        image: node:20
+        caches:
+          - node
+        script:
+          - npm ci
+          - npm run build
+        artifacts:
+          - dist/**
+
+    - step: &docker-smoke
+        name: CI - Docker Build & Run
+        services:
+          - docker
+        script:
+          - docker build -t ci-smoke-test:latest .
+          - docker run --rm ci-smoke-test:latest echo "Container started successfully"
+
+pipelines:
+  # =============  CI: develop / main 브랜치 (머지 후)  =============
+  branches:
+    develop:
+      - parallel:
+          - step: *lint-audit
+          - step: *build
+      # - step: *docker-smoke
+    feature/infra:
+      - parallel:
+          - step: *lint-audit
+          - step: *build
+      # - step: *docker-smoke
+    main:
+      - parallel:
+          - step: *lint-audit
+          - step: *build
+      # - step: *docker-smoke
+
+  # =============  CI: PR (main 대상)  =============
+  pull-requests:
+    '**':
+      - parallel:
+          - step: *lint-audit
+          - step: *build
+      # - step: *docker-smoke
+
+  # =============  CD: 태그 기반 배포  =============
+  tags:
+    'dev-*.*.*':
+      - step:
+          name: Build & Push Image to ECR (DEV)
+          services:
+            - docker
+          script:
+            - export DOCKER_BUILDKIT=0 
+            - docker build --build-arg BUILD_ENV=dev -t $AWS_ECR_NAME_DEV:$BITBUCKET_TAG -t $AWS_ECR_NAME_DEV .
+            - docker tag $AWS_ECR_NAME_DEV:$BITBUCKET_TAG $AWS_ECR_REPO/$AWS_ECR_NAME_DEV:$BITBUCKET_TAG
+            - docker tag $AWS_ECR_NAME_DEV:$BITBUCKET_TAG $AWS_ECR_REPO/$AWS_ECR_NAME_DEV:latest
+            - pipe: atlassian/aws-ecr-push-image:2.6.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                IMAGE_NAME: $AWS_ECR_NAME_DEV
+                TAGS: "$BITBUCKET_TAG latest"
+      - step:
+          name: Deploy to EC2 (DEV)
+          deployment: development
+          script:
+            - pipe: atlassian/ssh-run:0.8.1
+              variables:
+                SSH_USER: $DEPLOY_SSH_USER
+                SERVER: $DEPLOY_SSH_HOST_DEV
+                MODE: 'command'
+                COMMAND: |
+                  set -e
+                  sudo mkdir -p /var/log/vision-count-client
+
+                  aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ECR_REPO
+                  docker pull $AWS_ECR_REPO/$AWS_ECR_NAME_DEV:$BITBUCKET_TAG
+
+                  docker stop vision-count-client || true
+                  docker rm vision-count-client || true
+                  docker run -d --name vision-count-client \
+                    -p 80:80 \
+                    -v /var/log/vision-count-client:/var/log/nginx \
+                    $AWS_ECR_REPO/$AWS_ECR_NAME_DEV:$BITBUCKET_TAG
+
+                  docker image prune -f
+
+                  docker images "$AWS_ECR_REPO/$AWS_ECR_NAME_DEV" --format '{{.ID}}' \                                                                                                                           
+                    | awk '!seen[$0]++' | tail -n +6 \                                                                                                                                                           
+                    | xargs -r docker rmi -f || true
+              ENVIRONMENT_VARIABLES:
+                - AWS_DEFAULT_REGION
+                - AWS_ECR_REPO
+                - AWS_ECR_NAME_DEV
+                - BITBUCKET_TAG
+    '*.*.*':
+      - step:
+          name: Build & Push Image to ECR (PROD)
+          services:
+            - docker
+          script:
+            - export DOCKER_BUILDKIT=0 ## atlassian/default-image:2로 할 경우엔 주석
+            
+            - docker build -t $AWS_ECR_NAME:$BITBUCKET_TAG -t $AWS_ECR_NAME .
+            - docker tag $AWS_ECR_NAME:$BITBUCKET_TAG $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+            - docker tag $AWS_ECR_NAME:$BITBUCKET_TAG $AWS_ECR_REPO/$AWS_ECR_NAME:latest
+            - pipe: atlassian/aws-ecr-push-image:2.6.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                IMAGE_NAME: $AWS_ECR_NAME
+                TAGS: "$BITBUCKET_TAG latest"
+      - step:
+          name: Deploy to EC2 (PROD)
+          deployment: production
+          trigger: manual
+          script:
+            - pipe: atlassian/ssh-run:0.8.1
+              variables:
+                SSH_USER: $DEPLOY_SSH_USER
+                SERVER: $DEPLOY_SSH_HOST_PROD
+                MODE: 'command'
+                COMMAND: |
+                  set -e
+                  sudo mkdir -p /var/log/vision-count-client
+
+                  aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ECR_REPO
+                  docker pull $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+
+                  docker stop vision-count-client || true
+                  docker rm vision-count-client || true
+                  docker run -d --name vision-count-client \
+                    -p 80:80 \
+                    -v /var/log/vision-count-client:/var/log/nginx \
+                    $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+
+                  docker image prune -f
+
+                  docker images "$AWS_ECR_REPO/$AWS_ECR_NAME_DEV" --format '{{.ID}}' \                                                                                                                           
+                    | awk '!seen[$0]++' | tail -n +6 \                                                                                                                                                           
+                    | xargs -r docker rmi -f || true
+              ENVIRONMENT_VARIABLES:
+                - AWS_DEFAULT_REGION
+                - AWS_ECR_REPO
+                - AWS_ECR_NAME
+                - BITBUCKET_TAG
