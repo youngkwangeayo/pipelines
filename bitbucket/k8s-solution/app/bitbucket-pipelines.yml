@@ -21,7 +21,7 @@ pipelines:
             - aws configure set region $AWS_DEFAULT_REGION
 
             # ECR 로그인
-            - aws ecr get-login-password | docker login --username AWS --password-stdin 365485194891.dkr.ecr.ap-northeast-2.amazonaws.com
+            - aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ECR_REPO
 
             # 버전 정보 파일 생성
             - echo "{\"version\":\"$BITBUCKET_TAG\"}" > version.json
