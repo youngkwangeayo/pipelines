@@ -1,0 +1,201 @@
+#   ==============  TODO  ==============
+#   컨테이너 AWS 인증: 현재는 호스트 ~/.aws 를 RO 마운트(-v /home/ubuntu/.aws:/root/.aws:ro)로 주입.
+#   → 추후 EC2 인스턴스 IAM 롤로 전환한다 (디스크 시크릿 제거 + 자동 로테이션).
+#     전환 시 docker run 의 위 -v .aws 마운트 줄을 삭제하면 됨 (민감키 작업 때 함께).
+#   ===================================
+#
+#   ==============  레포지토리 환경 변수  ==============
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION        # CLI
+#   AWS_ECR_REPO, AWS_ECR_NAME                                         # ECR (DEV/PROD 공용, 태그로 구분)
+#   DEPLOY_SSH_USER                                                     # EC2 SSH 사용자(공용)
+#   DEPLOY_SSH_HOST_DEV, DEPLOY_SSH_HOST_PROD                           # EC2 호스트 (IP/도메인)
+#
+#   런타임 환경설정(.env)은 배포 대상 EC2 의 /etc/sony-counthub.conf 에 두고
+#   컨테이너에 --env-file 로 주입한다 (DATABASE_*, RABBITMQ_*, AWS_REGION/KINESIS_STREAM_NAME 등).
+#   ※ Kinesis 컨슈머라 AWS 자격증명이 필요하다 — EC2 인스턴스 IAM 롤이 없으면
+#     AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY 도 conf 에 포함한다.
+#   ※ DEV/PROD 각 호스트에 해당 파일이 미리 존재해야 한다 (644, root:root).
+#   =================================================
+image: atlassian/default-image:5
+
+definitions:
+  services:
+    docker:
+      memory: 3072   # Docker 빌드 OOM 방지 (기본 1024 → 3GB)
+  steps:
+    # ── CI 공통 스텝 (YAML 앵커) ──
+    - step: &audit
+        name: CI - Security Audit
+        image: node:22
+        caches:
+          - node
+        script:
+          - npm ci                                 # 커밋된 package-lock.json 기준 재현 설치
+          - npm audit --audit-level=high || true   # prod 의존성 취약점 리포트 (비차단)
+
+    - step: &build
+        name: CI - Build
+        image: node:22
+        caches:
+          - node
+        script:
+          - npm ci
+          - npm run build                          # tsc + tsc-alias (타입체크 + alias 재작성 검증)
+        artifacts:
+          - dist/**
+
+    - step: &docker-smoke
+        name: CI - Docker Build & Smoke
+        image: node:22         # npm ci 용 (docker CLI 는 services: docker 가 주입)
+        caches:
+          - node
+        services:
+          - docker
+        script:
+          - export DOCKER_BUILDKIT=0   # Bitbucket 은 buildkit privileged 컨테이너 불허 → 레거시 빌더 사용
+          - npm ci                     # node_modules 벤더링 — Dockerfile 이 COPY 하므로 빌드 전 준비 필수
+          - docker build -t ci-smoke-test:latest .
+          # 기본 CMD(node dist/index.js)는 require 시 main()이 즉시 실행돼 DB/Kinesis 에 붙으므로 CI 에서 부적합.
+          # 대신 부수효과 없는 모듈 로딩만 검증 → dist 생성 + tsc-alias 재작성(상대경로) 확인 (DB 불필요).
+          - docker run --rm ci-smoke-test:latest node -e "require('./dist/config/index.js'); console.log('dist OK')"
+
+pipelines:
+  # =============  CI: develop / main 브랜치 (머지 후)  =============
+  branches:
+    develop:
+      - parallel:
+          - step: *audit
+          - step: *build
+      - step: *docker-smoke
+    main:
+      - parallel:
+          - step: *audit
+          - step: *build
+      - step: *docker-smoke
+
+  # =============  CI: PR (main 대상)  =============
+  pull-requests:
+    '**':
+      - parallel:
+          - step: *audit
+          - step: *build
+      - step: *docker-smoke
+
+  # =============  CD: 태그 기반 배포  =============
+  tags:
+    'dev-*.*.*':
+      - step:
+          name: Build & Push Image to ECR (DEV)
+          image: node:22         # npm ci 용 (docker CLI 는 services: docker 가 주입)
+          caches:
+            - node
+          services:
+            - docker
+          script:
+            - export DOCKER_BUILDKIT=0   # 벤더링 방식: 사내 deps 는 npm ci 가 받고 Dockerfile 은 COPY 만 함 (빌드 중 git 불필요)
+            - npm ci                     # node_modules 벤더링 — Dockerfile 이 COPY 하므로 빌드 전 준비 필수
+            - export IMAGE_TAG="${BITBUCKET_TAG#dev-}"   # dev-1.2.3 → 1.2.3 (dev- 접두어 제거)
+            - docker build -t $AWS_ECR_NAME:$IMAGE_TAG -t $AWS_ECR_NAME .
+            - docker tag $AWS_ECR_NAME:$IMAGE_TAG $AWS_ECR_REPO/$AWS_ECR_NAME:$IMAGE_TAG
+            - docker tag $AWS_ECR_NAME:$IMAGE_TAG $AWS_ECR_REPO/$AWS_ECR_NAME:latest
+            - pipe: atlassian/aws-ecr-push-image:2.6.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                IMAGE_NAME: $AWS_ECR_NAME
+                TAGS: "$IMAGE_TAG latest"
+      - step:
+          name: Deploy to EC2 (DEV)
+          deployment: development
+          script:
+            - export IMAGE_TAG="${BITBUCKET_TAG#dev-}"   # dev-1.2.3 → 1.2.3 (원격으로 전달)
+            - pipe: atlassian/ssh-run:0.8.1
+              variables:
+                SSH_USER: $DEPLOY_SSH_USER
+                SERVER: $DEPLOY_SSH_HOST_DEV
+                MODE: 'command'
+                COMMAND: |
+                  set -e
+                  sudo mkdir -p /var/log/sony-counthub
+
+                  aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ECR_REPO
+                  docker pull $AWS_ECR_REPO/$AWS_ECR_NAME:$IMAGE_TAG
+
+                  docker stop sony-counthub || true
+                  docker rm sony-counthub || true
+                  docker run -d --name sony-counthub \
+                    --restart unless-stopped \
+                    --network host \
+                    --env-file /etc/sony-counthub.conf \
+                    -v /var/log/sony-counthub:/app/logs \
+                    -v /home/ubuntu/.aws:/root/.aws:ro \
+                    $AWS_ECR_REPO/$AWS_ECR_NAME:$IMAGE_TAG
+
+                  docker image prune -f
+                  docker images "$AWS_ECR_REPO/$AWS_ECR_NAME" --format '{{.ID}}' | awk '!seen[$0]++' | tail -n +6 | xargs -r docker rmi -f || true
+              ENVIRONMENT_VARIABLES:
+                - AWS_DEFAULT_REGION
+                - AWS_ECR_REPO
+                - AWS_ECR_NAME
+                - IMAGE_TAG
+    # =============  CD: PROD 배포 (태그 X.Y.Z)  =============
+    # 모델: "1 이미지 / 환경만 분리" — PROD 는 별도 build/push 없이, DEV 태그(dev-X.Y.Z)에서
+    #       이미 ECR 에 푸시된 동일 이미지(:X.Y.Z)를 pull 만 해서 PROD 호스트의
+    #       /etc/sony-counthub.conf(환경별 값)로 띄운다.
+    # 전제 (이게 갖춰져야 동작):
+    #   (1) 파이프라인 변수 — DEPLOY_SSH_HOST_PROD + production deployment env
+    #       (AWS_ECR_NAME·AWS_ECR_REPO 는 DEV 에서 이미 사용 중이라 추가 불필요)
+    #   (2) PROD EC2 환경 구성 — /etc/sony-counthub.conf 배치(644)
+    #       (Kinesis/DB/RabbitMQ 로 나가는 아웃바운드 워커 — inbound 포트 없음.
+    #        DB/RabbitMQ 가 같은 호스트면 conf 에서 127.0.0.1 + --network host 전제)
+    #   (3) 배포할 PROD 태그 X.Y.Z 는 먼저 dev-X.Y.Z 로 빌드·푸시된 버전이어야 함
+    #       (해당 이미지가 ECR 에 없으면 docker pull 실패).
+    #       ※ dev-1.2.3 은 dev-*.*.* 가 *.*.* 보다 구체적이라 DEV 쪽만 트리거됨(중복 실행 없음).
+    '*.*.*':
+      - step:
+          name: Verify image in ECR (PROD)
+          image: amazon/aws-cli:latest   # amazon/aws-cli 엔 메이저 단독 태그 '2' 가 없음 → latest(=v2)
+          # 자동 실행 가드 — dev-X.Y.Z 로 먼저 빌드·푸시된 이미지가 ECR 에 있는지 확인.
+          # 없으면 여기서 실패해 다음 manual 배포 스텝 자체가 막힌다.
+          # (manual 스텝은 파이프라인 첫 스텝이 될 수 없어, 이 자동 스텝이 앞에 필요하기도 하다)
+          script:
+            - >-
+              aws ecr describe-images
+              --repository-name "$AWS_ECR_NAME"
+              --image-ids imageTag="$BITBUCKET_TAG"
+              --region "$AWS_DEFAULT_REGION"
+      - step:
+          name: Deploy to EC2 (PROD)
+          deployment: production
+          trigger: manual          # Bitbucket UI 에서 사람이 Run 을 눌러야 배포 진행
+          script:
+            - pipe: atlassian/ssh-run:0.8.1
+              variables:
+                SSH_USER: $DEPLOY_SSH_USER
+                SERVER: $DEPLOY_SSH_HOST_PROD
+                MODE: 'command'
+                COMMAND: |
+                  set -e
+                  sudo mkdir -p /var/log/sony-counthub
+
+                  aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ECR_REPO
+                  docker pull $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+
+                  docker stop sony-counthub || true
+                  docker rm sony-counthub || true
+                  docker run -d --name sony-counthub \
+                    --restart unless-stopped \
+                    --network host \
+                    --env-file /etc/sony-counthub.conf \
+                    -v /var/log/sony-counthub:/app/logs \
+                    -v /home/ubuntu/.aws:/root/.aws:ro \
+                    $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+
+                  docker image prune -f
+                  docker images "$AWS_ECR_REPO/$AWS_ECR_NAME" --format '{{.ID}}' | awk '!seen[$0]++' | tail -n +6 | xargs -r docker rmi -f || true
+              ENVIRONMENT_VARIABLES:
+                - AWS_DEFAULT_REGION
+                - AWS_ECR_REPO
+                - AWS_ECR_NAME
+                - BITBUCKET_TAG
