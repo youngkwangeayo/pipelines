@@ -53,17 +53,12 @@ pipelines:
       - parallel:
           - step: *lint-audit
           - step: *build
-      # - step: *docker-smoke
-    feature/infra:
-      - parallel:
-          - step: *lint-audit
-          - step: *build
-      # - step: *docker-smoke
+      - step: *docker-smoke
     main:
       - parallel:
           - step: *lint-audit
           - step: *build
-      # - step: *docker-smoke
+      - step: *docker-smoke
 
   # =============  CI: PR (main 대상)  =============
   pull-requests:
@@ -71,7 +66,7 @@ pipelines:
       - parallel:
           - step: *lint-audit
           - step: *build
-      # - step: *docker-smoke
+      - step: *docker-smoke
 
   # =============  CD: 태그 기반 배포  =============
   tags:
