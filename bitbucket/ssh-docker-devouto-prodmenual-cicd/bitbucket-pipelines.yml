@@ -1,0 +1,175 @@
+# ============================================
+# visionai_backend 배포 파이프라인 (AWS ECR + EC2)
+# ============================================
+# 모델: "1 이미지 / 환경만 분리, 단일 태그 + 수동 승격"
+#   - X.Y.Z 태그를 push 하면 한 파이프라인 안에서:
+#       1) ECR 빌드/푸시 (자동)
+#       2) DEV 배포        (자동)
+#       3) PROD 배포        (manual — Bitbucket UI 에서 버튼 클릭)
+#   - DEV/PROD 는 같은 이미지(:X.Y.Z)를 쓰고, 환경값만 각 호스트의
+#     /etc/visionai_backend.conf (.env) 로 분리한다.
+#
+# ── 레포지토리/Deployment 환경 변수 ──
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION   # CLI/ECR push
+#   AWS_ECR_REPO   # 예: 365485194891.dkr.ecr.ap-northeast-2.amazonaws.com
+#   AWS_ECR_NAME   # 예: visionai_backend (ECR 리포지토리명 = 컨테이너명)
+#   DEPLOY_SSH_USER                         # EC2 SSH 사용자 (DEV/PROD 공용)
+#   DEPLOY_SSH_HOST_DEV, DEPLOY_SSH_HOST_PROD   # 각 EC2 호스트 (IP/도메인)
+#
+#   ※ 각 EC2 호스트에 사전 준비 필요:
+#     - /etc/visionai_backend.conf (.env, 644) — 환경별 런타임 설정
+#     - docker network 'srt_network' 존재 (docker network create srt_network)
+#     - 호스트가 ECR 로그인 가능해야 함 (인스턴스 IAM 롤 또는 ~/.aws)
+# ============================================
+
+image: atlassian/default-image:5
+
+definitions:
+  services:
+    docker:
+      memory: 3072   # Docker 빌드 OOM 방지 (기본 1024 → 3GB)
+  steps:
+    # ── CI 공통 스텝 (YAML 앵커) ──
+    - step: &audit
+        name: CI - Security Audit
+        image: node:22
+        caches:
+          - node
+        script:
+          - npm ci                                 # 커밋된 package-lock.json 기준 재현 설치
+          - npm audit --audit-level=high || true   # 의존성 취약점 리포트 (비차단)
+
+    - step: &build
+        name: CI - Build (typecheck)
+        image: node:22
+        caches:
+          - node
+        script:
+          - npm ci
+          - npm run build                          # tsc + tsc-alias (타입체크 + alias 재작성 검증)
+
+    - step: &docker-smoke
+        name: CI - Docker Build
+        image: node:22         # npm ci 용 (docker CLI 는 services: docker 가 주입)
+        caches:
+          - node
+        services:
+          - docker
+        script:
+          - export DOCKER_BUILDKIT=0   # Bitbucket 은 buildkit privileged 불허 → 레거시 빌더
+          - npm ci                     # node_modules 벤더링 — Dockerfile 이 COPY 하므로 빌드 전 준비 필수
+          # 배포와 동일한 멀티스테이지 빌드를 그대로 수행 → 이미지가 끝까지 빌드되는지 검증.
+          # (런타임은 DB/Redis 에 붙으므로 컨테이너 실행은 하지 않고 빌드 성공만 확인)
+          - docker build -t ci-smoke-test:latest .
+
+pipelines:
+  # =============  CI: develop / main 브랜치 (머지 후)  =============
+  branches:
+    develop:
+      - parallel:
+          - step: *audit
+          - step: *build
+      - step: *docker-smoke
+    main:
+      - parallel:
+          - step: *audit
+          - step: *build
+      - step: *docker-smoke
+
+  # =============  CI: PR  =============
+  pull-requests:
+    '**':
+      - parallel:
+          - step: *audit
+          - step: *build
+      - step: *docker-smoke
+
+  # =============  CD: 태그 기반 배포 (X.Y.Z)  =============
+  tags:
+    '*.*.*':
+      - step:
+          name: Build & Push Image to ECR
+          image: node:22         # npm ci 용 (docker CLI 는 services: docker 가 주입)
+          caches:
+            - node
+          services:
+            - docker
+          script:
+            - export DOCKER_BUILDKIT=0   # 벤더링: 사내 deps 는 npm ci 가 받고 Dockerfile 은 COPY 만 (빌드 중 git 불필요)
+            - npm ci                     # node_modules 벤더링 — Dockerfile 이 COPY 하므로 빌드 전 준비 필수
+            - docker build -t $AWS_ECR_NAME:$BITBUCKET_TAG -t $AWS_ECR_NAME:latest .
+            - pipe: atlassian/aws-ecr-push-image:2.6.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                IMAGE_NAME: $AWS_ECR_NAME
+                TAGS: "$BITBUCKET_TAG latest"
+
+      - step:
+          name: Deploy to EC2 (DEV)
+          deployment: development
+          script:
+            - pipe: atlassian/ssh-run:0.8.1
+              variables:
+                SSH_USER: $DEPLOY_SSH_USER
+                SERVER: $DEPLOY_SSH_HOST_DEV
+                MODE: 'command'
+                COMMAND: |
+                  set -e
+                  sudo mkdir -p /var/log/$AWS_ECR_NAME
+
+                  aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ECR_REPO
+                  docker pull $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+
+                  docker stop $AWS_ECR_NAME || true
+                  docker rm $AWS_ECR_NAME || true
+                  docker run -d --name $AWS_ECR_NAME \
+                    --restart unless-stopped \
+                    -p 3000:3000 \
+                    --network srt_network \
+                    -v /etc/$AWS_ECR_NAME.conf:/app/.env \
+                    -v /var/log/$AWS_ECR_NAME:/app/logs \
+                    $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+
+                  docker image prune -f
+                  docker images "$AWS_ECR_REPO/$AWS_ECR_NAME" --format '{{.ID}}' | awk '!seen[$0]++' | tail -n +6 | xargs -r docker rmi -f || true
+              ENVIRONMENT_VARIABLES:
+                - AWS_ECR_REPO
+                - AWS_ECR_NAME
+                - BITBUCKET_TAG
+
+      # PROD 는 같은 X.Y.Z 이미지를 manual 로 승격 배포 (UI 에서 Run 클릭)
+      - step:
+          name: Deploy to EC2 (PROD)
+          deployment: production
+          trigger: manual
+          script:
+            - pipe: atlassian/ssh-run:0.8.1
+              variables:
+                SSH_USER: $DEPLOY_SSH_USER
+                SERVER: $DEPLOY_SSH_HOST_PROD
+                MODE: 'command'
+                COMMAND: |
+                  set -e
+                  sudo mkdir -p /var/log/$AWS_ECR_NAME
+
+                  aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ECR_REPO
+                  docker pull $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+
+                  docker stop $AWS_ECR_NAME || true
+                  docker rm $AWS_ECR_NAME || true
+                  docker run -d --name $AWS_ECR_NAME \
+                    --restart unless-stopped \
+                    -p 3000:3000 \
+                    --network srt_network \
+                    -v /etc/$AWS_ECR_NAME.conf:/app/.env \
+                    -v /var/log/$AWS_ECR_NAME:/app/logs \
+                    $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+
+                  docker image prune -f
+                  docker images "$AWS_ECR_REPO/$AWS_ECR_NAME" --format '{{.ID}}' | awk '!seen[$0]++' | tail -n +6 | xargs -r docker rmi -f || true
+              ENVIRONMENT_VARIABLES:
+                - AWS_ECR_REPO
+                - AWS_ECR_NAME
+                - BITBUCKET_TAG
