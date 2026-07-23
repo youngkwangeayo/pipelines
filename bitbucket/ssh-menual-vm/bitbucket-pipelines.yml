@@ -1,0 +1,192 @@
+#   ==============  레포지토리 환경 변수  ==============
+#   모델: "1 이미지 / 환경만 분리, 단일 태그 + 수동 승격"
+#     - X.Y.Z 태그 push → 한 파이프라인: ①ECR 빌드/푸시(자동) ②DEV(자동) ③STG(manual) ④PROD(manual)
+#     - DEV/STG/PROD 는 같은 이미지(:X.Y.Z)를 쓰고, 환경값·접속 host 만 각 호스트 conf 로 분리.
+#
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION        # CLI
+#   AWS_ECR_REPO, AWS_ECR_NAME                                         # ECR (DEV/STG/PROD 공용)
+#   DEPLOY_SSH_USER                                                     # EC2 SSH 사용자(공용)
+#   DEPLOY_SSH_HOST_DEV, DEPLOY_SSH_HOST_STG, DEPLOY_SSH_HOST_PROD      # EC2 호스트 (IP/도메인)
+#
+#   런타임 환경설정(.env)은 배포 대상 EC2 의 /etc/ai-hub-api.conf 에 두고
+#   컨테이너에 --env-file 로 주입한다 (DATABASE_*, REDIS_URL, ENCRYPTION_KEY 등 시크릿).
+#   ※ DEV/STG/PROD 각 호스트에 해당 파일이 미리 존재해야 한다 (644, root:root).
+#   =================================================
+image: atlassian/default-image:5
+
+definitions:
+  services:
+    docker:
+      memory: 3072   # Docker 빌드 OOM 방지 (기본 1024 → 3GB)
+  steps:
+    # ── CI 공통 스텝 (YAML 앵커) ──
+    - step: &audit
+        name: CI - Security Audit
+        image: node:22
+        caches:
+          - node
+        script:
+          - npm ci                                 # 커밋된 package-lock.json 기준 재현 설치
+          - npm audit --audit-level=high || true   # prod 의존성 취약점 리포트 (비차단)
+
+    - step: &build
+        name: CI - Build
+        image: node:22
+        caches:
+          - node
+        script:
+          - npm ci
+          - npm run build                          # tsc + tsc-alias (타입체크 + alias 재작성 검증)
+        artifacts:
+          - dist/**
+
+    - step: &docs-check
+        name: CI - Docs Cross-Check
+        image: node:22
+        caches:
+          - node
+        script:
+          - npm ci
+          - npm run docs:check                     # 코드·Swagger·AGENTS.md 3자 정합 (드리프트 시 실패 → 머지 차단)
+
+    - step: &docker-smoke
+        name: CI - Docker Build & Smoke
+        services:
+          - docker
+        script:
+          - export DOCKER_BUILDKIT=0   # Bitbucket 은 buildkit privileged 컨테이너 불허 → 레거시 빌더 사용
+          - docker build -t ci-smoke-test:latest .
+          # 기본 CMD(node dist/index.js)는 DB/Redis 가 필요하므로 그대로 띄우면 CI 에서 실패.
+          # 대신 컴파일 산출물 로딩만 검증 → alias 해석 + swagger yml 포함 여부까지 잡힘 (DB 불필요).
+          - docker run --rm ci-smoke-test:latest node -e "require('./dist/app.js')"
+
+pipelines:
+  # =============  CI: develop / main 브랜치 (머지 후)  =============
+  branches:
+    develop:
+      - parallel:
+          - step: *audit
+          - step: *build
+          - step: *docs-check
+      - step: *docker-smoke
+    main:
+      - parallel:
+          - step: *audit
+          - step: *build
+          - step: *docs-check
+      - step: *docker-smoke
+
+  # =============  CI: PR (main 대상)  =============
+  pull-requests:
+    '**':
+      - parallel:
+          - step: *audit
+          - step: *build
+          - step: *docs-check
+      - step: *docker-smoke
+
+  # =============  CD: 태그 기반 배포 (X.Y.Z — 단일 태그 + 수동 승격)  =============
+  # 모델: "1 이미지 / 환경만 분리" — X.Y.Z 태그 하나를 push 하면 한 파이프라인 안에서:
+  #   1) ECR 빌드/푸시 (자동)
+  #   2) DEV 배포        (자동)
+  #   3) STG 배포        (manual — Bitbucket UI 에서 Run 버튼)
+  #   4) PROD 배포       (manual — Bitbucket UI 에서 Run 버튼)
+  # DEV/STG/PROD 는 같은 이미지(:X.Y.Z)를 쓰고, 환경값·접속 host 만 각 호스트의
+  # /etc/ai-hub-api.conf 로 분리한다 (STG/PROD 는 build 없이 동일 이미지 pull 만).
+  #
+  # ── [고려중] 대안: STG/PROD 를 parallel 로 묶어 각각 독립 승격 ──────────────
+  # 지금은 STG → PROD 가 선형 manual 이라 PROD 를 누르려면 STG 스텝을 먼저 실행해야 한다.
+  # STG 를 건너뛰고 PROD 직행하거나 두 환경을 서로 독립 승격하고 싶으면, DEV 뒤의
+  # STG·PROD 두 스텝을 parallel 그룹으로 묶는다 (둘 다 trigger: manual 유지):
+  #
+  #   - step: {Build & Push}       # 자동
+  #   - step: {Deploy DEV}         # 자동
+  #   - parallel:
+  #       - step: {Deploy STG, trigger: manual}
+  #       - step: {Deploy PROD, trigger: manual}
+  #
+  #   → DEV 완료 후 STG·PROD 버튼이 각각 독립적으로 뜬다(선형 의존 없음, 하나만 눌러도 됨).
+  #   앵커(&deploy_command·&deploy_env)는 그대로 재사용 가능. 단일 태그·1 이미지 모델 유지.
+  # ──────────────────────────────────────────────────────────────────────
+  tags:
+    '*.*.*':
+      - step:
+          name: Build & Push Image to ECR
+          services:
+            - docker
+          script:
+            - export DOCKER_BUILDKIT=0   # 사내 deps 를 ssh mount 로 받게 되면 1 로 변경 (Dockerfile 주석 참고)
+            # BUILD_SHA/BUILD_TIME → 스탬프 · API_VERSION=배포 태그(BITBUCKET_TAG) → Swagger info.version·manifest 에 구움(.env 불요)
+            - docker build --build-arg BUILD_SHA="$BITBUCKET_COMMIT" --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --build-arg API_VERSION="$BITBUCKET_TAG" -t $AWS_ECR_NAME:$BITBUCKET_TAG -t $AWS_ECR_NAME .
+            - docker tag $AWS_ECR_NAME:$BITBUCKET_TAG $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+            - docker tag $AWS_ECR_NAME:$BITBUCKET_TAG $AWS_ECR_REPO/$AWS_ECR_NAME:latest
+            - pipe: atlassian/aws-ecr-push-image:2.6.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                IMAGE_NAME: $AWS_ECR_NAME
+                TAGS: "$BITBUCKET_TAG latest"
+
+      - step:
+          name: Deploy to EC2 (DEV)
+          deployment: development
+          script:
+            - pipe: atlassian/ssh-run:0.8.1
+              variables:
+                SSH_USER: $DEPLOY_SSH_USER
+                SERVER: $DEPLOY_SSH_HOST_DEV
+                MODE: 'command'
+                # 배포 COMMAND·ENVIRONMENT_VARIABLES 는 DEV/STG/PROD 동일 → 여기서 앵커 정의, STG/PROD 는 alias 참조.
+                # (환경차는 SERVER(host IP)·deployment·trigger 뿐. 같은 이미지 :$BITBUCKET_TAG 를 각 호스트 conf 로 띄움)
+                COMMAND: &deploy_command |
+                  set -e
+                  sudo mkdir -p /var/log/ai-hub-api
+
+                  aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ECR_REPO
+                  docker pull $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+
+                  docker stop ai-hub-api || true
+                  docker rm ai-hub-api || true
+                  docker run -d --name ai-hub-api \
+                    --restart unless-stopped \
+                    --network host \
+                    --env-file /etc/ai-hub-api.conf \
+                    -v /var/log/ai-hub-api:/app/logs \
+                    $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+
+                  docker image prune -f
+                  docker images "$AWS_ECR_REPO/$AWS_ECR_NAME" --format '{{.ID}}' | awk '!seen[$0]++' | tail -n +6 | xargs -r docker rmi -f || true
+              ENVIRONMENT_VARIABLES: &deploy_env
+                - AWS_DEFAULT_REGION
+                - AWS_ECR_REPO
+                - AWS_ECR_NAME
+                - BITBUCKET_TAG
+
+      # STG 는 같은 X.Y.Z 이미지를 manual 로 승격 배포 (UI 에서 Run 클릭). host IP 만 DEV 와 다름.
+      - step:
+          name: Deploy to EC2 (STG)
+          deployment: staging
+          trigger: manual
+          script:
+            - pipe: atlassian/ssh-run:0.8.1
+              variables:
+                SSH_USER: $DEPLOY_SSH_USER
+                SERVER: $DEPLOY_SSH_HOST_STG
+                MODE: 'command'
+                COMMAND: *deploy_command
+              ENVIRONMENT_VARIABLES: *deploy_env
+
+      # PROD 는 같은 X.Y.Z 이미지를 manual 로 승격 배포 (UI 에서 Run 클릭). host IP 만 DEV 와 다름.
+      - step:
+          name: Deploy to EC2 (PROD)
+          deployment: production
+          trigger: manual
+          script:
+            - pipe: atlassian/ssh-run:0.8.1
+              variables:
+                SSH_USER: $DEPLOY_SSH_USER
+                SERVER: $DEPLOY_SSH_HOST_PROD
+                MODE: 'command'
+                COMMAND: *deploy_command
+              ENVIRONMENT_VARIABLES: *deploy_env
