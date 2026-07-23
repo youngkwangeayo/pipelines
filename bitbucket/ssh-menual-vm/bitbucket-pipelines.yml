@@ -142,21 +142,28 @@ pipelines:
                 COMMAND: &deploy_command |
                   set -e
                   sudo mkdir -p /var/log/ai-hub-api
+                  # 컨테이너는 non-root(node, uid 1000)로 실행 → 마운트된 로그 디렉토리를 node 소유로(EACCES 방지)
+                  sudo chown -R 1000:1000 /var/log/ai-hub-api
 
                   aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ECR_REPO
                   docker pull $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
 
                   docker stop ai-hub-api || true
                   docker rm ai-hub-api || true
+                  # srt_network(공유 user-defined bridge) 합류 → redis 등 형제 컨테이너에 이름 DNS(srt_redis:6379)로 접속.
+                  # 외부/nginx 접근용으로 호스트 8093 publish. (conf 의 REDIS_URL=redis://srt_redis:6379 전제)
                   docker run -d --name ai-hub-api \
                     --restart unless-stopped \
-                    --network host \
+                    --network srt_network \
+                    -p 8093:8093 \
                     --env-file /etc/ai-hub-api.conf \
                     -v /var/log/ai-hub-api:/app/logs \
                     $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
 
                   docker image prune -f
-                  docker images "$AWS_ECR_REPO/$AWS_ECR_NAME" --format '{{.ID}}' | awk '!seen[$0]++' | tail -n +6 | xargs -r docker rmi -f || true
+                  # 오래된 이미지 정리: 최신 10개(고유 ID)만 남기고 삭제.
+                  # uniq 로 멀티태그(:X.Y.Z + :latest = 같은 ID 인접 2줄) 중복 제거 — awk '!seen[$0]++' 는 ssh-run 쉘이 $0 를 치환해 깨져서 회피.
+                  docker images "$AWS_ECR_REPO/$AWS_ECR_NAME" --format '{{.ID}}' | uniq | tail -n +11 | xargs -r docker rmi -f || true
 
                   # ── 배포 후 컨테이너 running 확인 — 아니면 최근 로그 출력 후 스텝 실패 ──
                   sleep 3 && docker inspect -f '{{.State.Status}}' ai-hub-api | grep -q running || { docker logs --tail 80 ai-hub-api; exit 1; }
