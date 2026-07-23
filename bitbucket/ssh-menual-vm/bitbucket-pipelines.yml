@@ -157,6 +157,9 @@ pipelines:
 
                   docker image prune -f
                   docker images "$AWS_ECR_REPO/$AWS_ECR_NAME" --format '{{.ID}}' | awk '!seen[$0]++' | tail -n +6 | xargs -r docker rmi -f || true
+
+                  # ── 배포 후 컨테이너 running 확인 — 아니면 최근 로그 출력 후 스텝 실패 ──
+                  sleep 3 && docker inspect -f '{{.State.Status}}' ai-hub-api | grep -q running || { docker logs --tail 80 ai-hub-api; exit 1; }
               ENVIRONMENT_VARIABLES: &deploy_env
                 - AWS_DEFAULT_REGION
                 - AWS_ECR_REPO
@@ -177,16 +180,16 @@ pipelines:
                 COMMAND: *deploy_command
               ENVIRONMENT_VARIABLES: *deploy_env
 
-      # PROD 는 같은 X.Y.Z 이미지를 manual 로 승격 배포 (UI 에서 Run 클릭). host IP 만 DEV 와 다름.
-      - step:
-          name: Deploy to EC2 (PROD)
-          deployment: production
-          trigger: manual
-          script:
-            - pipe: atlassian/ssh-run:0.8.1
-              variables:
-                SSH_USER: $DEPLOY_SSH_USER
-                SERVER: $DEPLOY_SSH_HOST_PROD
-                MODE: 'command'
-                COMMAND: *deploy_command
-              ENVIRONMENT_VARIABLES: *deploy_env
+      # # PROD 는 같은 X.Y.Z 이미지를 manual 로 승격 배포 (UI 에서 Run 클릭). host IP 만 DEV 와 다름.
+      # - step:
+      #     name: Deploy to EC2 (PROD)
+      #     deployment: production
+      #     trigger: manual
+      #     script:
+      #       - pipe: atlassian/ssh-run:0.8.1
+      #         variables:
+      #           SSH_USER: $DEPLOY_SSH_USER
+      #           SERVER: $DEPLOY_SSH_HOST_PROD
+      #           MODE: 'command'
+      #           COMMAND: *deploy_command
+      #         ENVIRONMENT_VARIABLES: *deploy_env
