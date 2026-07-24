@@ -1,0 +1,46 @@
+# 코드 배포 파이프라인 — 인프라(iac-terraform/infra/shared/audit-notifier)가 만든
+# 두 리전 Lambda 함수에 src/ 코드를 push한다. TF는 함수 껍데기를, 파이프라인은 코드를 소유.
+#
+# 인증: AWS 액세스 키 방식. Bitbucket repository variables(Settings → Repository variables)에
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (둘 다 Secured), AWS_DEFAULT_REGION=ap-northeast-2
+# 를 넣어두면 awscli가 자동으로 읽는다. (OIDC 대안: bitbucket-pipelines.oidc.yml 참고)
+
+image: python:3.13-slim
+
+definitions:
+  steps:
+    - step: &test
+        name: Test
+        script:
+          - pip install --quiet pytest
+          - python -m pytest -q
+    - step: &deploy
+        name: Deploy Lambda code (apne2 + us-east-1)
+        deployment: production
+        script:
+          - pip install --quiet awscli
+          # src/ 내용을 zip 루트에 담는다(__pycache__/*.pyc 제외). apt 불필요.
+          - |
+            python - <<'EOF'
+            import os, zipfile
+            with zipfile.ZipFile("lambda.zip", "w", zipfile.ZIP_DEFLATED) as z:
+                for root, _, files in os.walk("src"):
+                    if "__pycache__" in root:
+                        continue
+                    for f in files:
+                        if f.endswith(".pyc"):
+                            continue
+                        p = os.path.join(root, f)
+                        z.write(p, os.path.relpath(p, "src"))
+            EOF
+          - aws lambda update-function-code --function-name lambda-shared-audit-notifier-apne2 --zip-file fileb://lambda.zip --region ap-northeast-2 --publish
+          - aws lambda update-function-code --function-name lambda-shared-audit-notifier-use1  --zip-file fileb://lambda.zip --region us-east-1     --publish
+
+pipelines:
+  branches:
+    main:
+      - step: *test
+      - step: *deploy
+  pull-requests:
+    "**":
+      - step: *test

@@ -1,0 +1,52 @@
+# 참고용 — OIDC 인증 버전. 키 방식(bitbucket-pipelines.yml)과 배포 로직은 동일하고
+# "AWS 인증 방법"만 다르다. 전환하려면 이 파일을 bitbucket-pipelines.yml 로 바꾸고,
+# 인프라의 IAM도 키 유저 → OIDC 역할로 전환한다(iam-oidc-deployer.tf.reference).
+#
+# 키 방식과의 차이: 장기 액세스 키 대신, Bitbucket이 실행 시점 단기 OIDC 토큰을 발급하고
+# 그걸로 IAM 역할을 assume한다. Bitbucket 저장소 변수에는 키 대신 AWS_ROLE_ARN(배포 역할
+# ARN)만 넣는다. deploy 스텝에 oidc: true 가 붙는 게 핵심.
+
+image: python:3.13-slim
+
+definitions:
+  steps:
+    - step: &test
+        name: Test
+        script:
+          - pip install --quiet pytest
+          - python -m pytest -q
+    - step: &deploy
+        name: Deploy Lambda code (apne2 + us-east-1)
+        deployment: production
+        oidc: true # ← Bitbucket이 이 스텝에 OIDC 토큰을 주입
+        script:
+          - pip install --quiet awscli
+          # OIDC 토큰으로 역할 assume (awscli가 web identity로 자동 처리)
+          - export AWS_REGION=ap-northeast-2
+          - export AWS_ROLE_ARN=$AWS_ROLE_ARN # 저장소 변수로 주입(배포 역할 ARN)
+          - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+          - echo "$BITBUCKET_STEP_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
+          - |
+            python - <<'EOF'
+            import os, zipfile
+            with zipfile.ZipFile("lambda.zip", "w", zipfile.ZIP_DEFLATED) as z:
+                for root, _, files in os.walk("src"):
+                    if "__pycache__" in root:
+                        continue
+                    for f in files:
+                        if f.endswith(".pyc"):
+                            continue
+                        p = os.path.join(root, f)
+                        z.write(p, os.path.relpath(p, "src"))
+            EOF
+          - aws lambda update-function-code --function-name lambda-shared-audit-notifier-apne2 --zip-file fileb://lambda.zip --region ap-northeast-2 --publish
+          - aws lambda update-function-code --function-name lambda-shared-audit-notifier-use1  --zip-file fileb://lambda.zip --region us-east-1     --publish
+
+pipelines:
+  branches:
+    main:
+      - step: *test
+      - step: *deploy
+  pull-requests:
+    "**":
+      - step: *test
