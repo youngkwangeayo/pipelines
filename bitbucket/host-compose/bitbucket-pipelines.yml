@@ -1,0 +1,191 @@
+#   ==============  NanoPortalAPI CI/CD  ==============
+#   모델: "1 이미지 / 환경만 분리, 단일 태그 + 수동 승격"
+#     - X.Y.Z 태그 push → 한 파이프라인: ①ECR 빌드/푸시(자동) ②DEV(자동) ③PROD(manual)
+#     - DEV/PROD 는 같은 이미지(:X.Y.Z)를 쓰고, 환경값·접속 host 만 각 호스트 conf 로 분리.
+#
+#   레포지토리 환경 변수
+#     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION   # CLI
+#     AWS_ECR_REPO        # <acct>.dkr.ecr.ap-northeast-2.amazonaws.com
+#     AWS_ECR_NAME        # nano-portal-api  (ECR 리포지토리명 = 컨테이너명)
+#     DEPLOY_SSH_USER     # EC2 SSH 사용자(공용)
+#
+#   Deployment 변수 (Settings > Deployments > development / production 각각)
+#     DEPLOY_SSH_HOST     # 해당 환경의 EC2 호스트 (IP/도메인)
+#   → 환경 차이는 접속 host 뿐. 배포 스텝 정의는 한 벌만 유지한다.
+#
+#   호스트 구성은 레포의 infra/ 에서 관리한다 (compose.yml · bootstrap.sh).
+#   배포 스텝이 infra/ 를 /opt/nano-portal-api/ 로 복사한 뒤 docker compose up -d.
+#
+#   호스트당 1회 수동 준비 (배포 전에 끝나 있어야 한다):
+#     sudo bash infra/bootstrap.sh                       ← 디렉토리 생성 + 소유권 uid 1000
+#     /opt/nano-portal-api/config/nano-portal-api.conf   ← 시크릿. 사람이 직접 배치
+#     docker network create srt_network                  ← 없을 때만
+#   ※ 컨테이너는 non-root(node, uid 1000) 로 3001 을 리슨한다 (호스트 publish 도 3001).
+#     conf 의 SERVICE_PORT 는 로컬 실행용이라 배포 시 compose 의 environment 가 덮어쓴다.
+#     (PUBLIC_BASE_URL 은 외부에서 실제 접근하는 주소로 채울 것)
+#
+#   배포 대상 EC2 전제
+#     · AWS CLI v2 + docker compose v2 플러그인 설치
+#     · ECR 읽기 권한 인스턴스 프로파일 부착 (배포 스크립트가 인스턴스 자격증명으로 로그인 —
+#       액세스 키를 서버에 두지 않는다)
+#     · DEPLOY_SSH_USER 가 docker 그룹 소속이고 /opt/nano-portal-api 에 쓸 수 있을 것
+#       (배포에 sudo 는 쓰지 않는다)
+#
+#   Bitbucket 쪽 사전 준비
+#     · Settings > SSH keys 에서 키 생성 → 공개키를 각 서버 authorized_keys 에 등록,
+#       Known hosts 에 배포 호스트 추가
+#     · Settings > Deployments 에 development / production 환경 생성
+#
+#   자세한 절차는 infra/README.md
+#   ===================================================
+image: atlassian/default-image:5
+
+definitions:
+  services:
+    docker:
+      memory: 3072   # Docker 빌드 OOM 방지 (기본 1024 → 3GB). bcrypt 네이티브 컴파일 포함
+
+  steps:
+    # ── CI 공통 스텝 (YAML 앵커) ──
+    - step: &audit
+        name: CI - Security Audit
+        image: node:20
+        caches:
+          - node
+        script:
+          - npm ci                                 # 커밋된 package-lock.json 기준 재현 설치
+          - npm audit --audit-level=high || true   # 취약점 리포트 (비차단)
+
+    - step: &build
+        name: CI - Build
+        image: node:20
+        caches:
+          - node
+        script:
+          - npm ci
+          - npm run build                          # tsc + tsc-alias (타입체크 + alias 재작성 검증)
+
+    - step: &docker-smoke
+        name: CI - Docker Build & Smoke
+        services:
+          - docker
+        script:
+          - export DOCKER_BUILDKIT=0   # Bitbucket 은 buildkit privileged 컨테이너 불허 → 레거시 빌더 사용
+          - docker build -t ci-smoke-test:latest .
+          # index.js 는 DB/Redis/MQTT 에 붙으므로 CI 에서 못 띄운다.
+          # app.js 는 순수 express 조립부라 외부 의존 없이 로딩만 검증 가능
+          # → @lib/@middlewares alias 해석 + swagger yml 포함 여부까지 잡힌다.
+          - docker run --rm ci-smoke-test:latest node -e "require('./dist/app.js')"
+
+    # ── CD 배포 스텝 (YAML 앵커) ──
+    # 배포 스텝 템플릿. 환경 차이는 접속 host(Deployment 변수)뿐이라 script 는 한 벌이면 된다.
+    # 각 환경 스텝은 name/deployment/trigger 만 달리 두고 script 를 alias(*deploy-script) 로 참조한다.
+    # (`<<:` 머지 키는 파서 호환이 불확실해 쓰지 않는다)
+    - step:
+        name: Deploy to EC2 (템플릿 — 직접 실행되지 않음)
+        script: &deploy-script
+          # 1) 호스트 구성을 레포 기준으로 갱신 — 이게 "구성을 코드로 관리"하는 지점이다.
+          #    infra/ 에 파일이 늘어나도 그대로 따라가도록 '/*' 로 통째 전송한다.
+          #    (bootstrap.sh 도 함께 올라가지만 실행은 호스트당 1회 수동)
+          - pipe: atlassian/scp-deploy:1.4.1
+            variables:
+              USER: $DEPLOY_SSH_USER
+              SERVER: $DEPLOY_SSH_HOST
+              REMOTE_PATH: /opt/nano-portal-api
+              LOCAL_PATH: '${BITBUCKET_CLONE_DIR}/infra/*'
+
+          # 2) 준비 → 기동 → 정리 → 확인
+          - pipe: atlassian/ssh-run:0.8.1
+            variables:
+              SSH_USER: $DEPLOY_SSH_USER
+              SERVER: $DEPLOY_SSH_HOST
+              MODE: 'command'
+              COMMAND: |
+                set -e
+                cd /opt/nano-portal-api
+
+                # compose 변수 치환용 .env — 서버에서 수동으로 compose 를 다룰 때도 그대로 쓰인다
+                cat > .env <<CONF
+                AWS_ECR_REPO=$AWS_ECR_REPO
+                AWS_ECR_NAME=$AWS_ECR_NAME
+                IMAGE_TAG=$BITBUCKET_TAG
+                CONF
+
+                # 디렉토리·소유권 준비(bootstrap.sh)와 conf 배치는 호스트당 1회 수동. 여기서는 하지 않는다.
+                # ECR 로그인은 EC2 인스턴스 프로파일 자격증명 사용 (서버에 액세스 키를 두지 않음)
+                aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ECR_REPO
+                docker compose pull
+                docker compose up -d --remove-orphans
+
+                docker image prune -f
+                # 오래된 이미지 정리: 최신 10개(고유 ID)만 남기고 삭제.
+                # uniq 로 멀티태그(:X.Y.Z + :latest = 같은 ID 인접 2줄) 중복 제거 — awk '!seen[$0]++' 는 ssh-run 쉘이 $0 를 치환해 깨져서 회피.
+                docker images "$AWS_ECR_REPO/$AWS_ECR_NAME" --format '{{.ID}}' | uniq | tail -n +11 | xargs -r docker rmi -f || true
+
+                # ── 배포 후 컨테이너 running 확인 — 아니면 최근 로그 출력 후 스텝 실패 ──
+                sleep 3 && docker inspect -f '{{.State.Status}}' nano-portal-api | grep -q running || { docker compose logs --tail 80; exit 1; }
+                docker compose ps
+
+pipelines:
+  # =============  CI: develop / master 브랜치 (머지 후)  =============
+  branches:
+    develop:
+      - parallel:
+          - step: *audit
+          - step: *build
+      - step: *docker-smoke
+    master:
+      - parallel:
+          - step: *audit
+          - step: *build
+      - step: *docker-smoke
+
+  # =============  CI: PR  =============
+  pull-requests:
+    '**':
+      - parallel:
+          - step: *audit
+          - step: *build
+      - step: *docker-smoke
+
+  # =============  CD: 태그 기반 배포 (X.Y.Z)  =============
+  # X.Y.Z 태그를 push 하면 한 파이프라인 안에서:
+  #   1) ECR 빌드/푸시 (자동)
+  #   2) DEV 배포       (자동)
+  #   3) PROD 배포      (manual — Bitbucket UI 에서 Run 버튼)
+  # DEV/PROD 는 같은 이미지(:X.Y.Z)를 쓰고, 환경값은 각 호스트의
+  # /opt/nano-portal-api/config/nano-portal-api.conf 로 분리한다 (PROD 는 build 없이 pull 만).
+  tags:
+    '*.*.*':
+      - step:
+          name: Build & Push Image to ECR
+          services:
+            - docker
+          script:
+            - export DOCKER_BUILDKIT=0
+            # @nextpay/* 는 public Bitbucket repo(git+https) 라 빌드에 SSH 키가 필요 없다.
+            # API_VERSION: 배포 태그를 이미지에 구워 Swagger info.version 으로 노출한다.
+            - docker build --build-arg API_VERSION="$BITBUCKET_TAG" -t $AWS_ECR_NAME:$BITBUCKET_TAG -t $AWS_ECR_NAME .
+            - docker tag $AWS_ECR_NAME:$BITBUCKET_TAG $AWS_ECR_REPO/$AWS_ECR_NAME:$BITBUCKET_TAG
+            - docker tag $AWS_ECR_NAME:$BITBUCKET_TAG $AWS_ECR_REPO/$AWS_ECR_NAME:latest
+            # 파이프 사용 이유: ECR 리포지토리 자동 생성 + 로그인/재시도 처리 내장
+            - pipe: atlassian/aws-ecr-push-image:2.6.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                IMAGE_NAME: $AWS_ECR_NAME
+                TAGS: "$BITBUCKET_TAG latest"
+
+      - step:
+          name: Deploy to EC2 (DEV)
+          deployment: development
+          script: *deploy-script
+
+      # PROD 는 같은 X.Y.Z 이미지를 manual 로 승격 배포 (UI 에서 Run 클릭).
+      # DEV 와의 차이는 production Deployment 변수의 DEPLOY_SSH_HOST 뿐이다.
+      - step:
+          name: Deploy to EC2 (PROD)
+          deployment: production
+          trigger: manual
+          script: *deploy-script

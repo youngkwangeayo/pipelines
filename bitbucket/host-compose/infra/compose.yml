@@ -1,0 +1,80 @@
+# NanoPortalAPI 배포용 Compose — 레포에서 관리하고 파이프라인이 서버로 올린다.
+#
+# 서버 배치 (파이프라인이 infra/ 내용을 REMOTE_PATH 로 복사):
+#   /opt/nano-portal-api/compose.yml
+#   /opt/nano-portal-api/bootstrap.sh              ← 실행은 호스트당 1회 수동
+#   /opt/nano-portal-api/.env                      ← 파이프라인이 배포 때 생성 (compose 변수 치환용)
+#   /opt/nano-portal-api/config/nano-portal-api.conf  ← 시크릿. 최초 1회 사람이 직접 배치 (레포에 없음)
+#   /opt/nano-portal-api/upload                    ← 업로드 볼륨
+#   /var/log/nano-portal-api                       ← 로그 볼륨
+#   ~/nano-portal-api                              ← /opt/nano-portal-api 심볼릭 (접근 편의)
+#   (디렉토리 생성·소유권(uid 1000)·심볼릭은 bootstrap.sh 로 호스트당 1회 수동 실행)
+#
+# 수동 조작:
+#   cd /opt/nano-portal-api && docker compose ps | logs -f | restart
+#   (.env 가 있으므로 변수 지정 없이 그대로 동작한다)
+
+services:
+  api:
+    image: ${AWS_ECR_REPO}/${AWS_ECR_NAME}:${IMAGE_TAG}
+    container_name: nano-portal-api
+    restart: unless-stopped
+
+    # 포트는 3001 하나로 통일 (호스트=컨테이너).
+    # 같은 호스트의 다른 앱과 겹치면 이 줄의 왼쪽만 바꾼다.
+    ports:
+      - "3001:3001"
+
+    volumes:
+      # 시크릿은 이미지에 굽지 않고 런타임 마운트 — 앱의 dotenv 가 /app/.env 를 읽는다.
+      # env_file 이 아니라 볼륨인 이유: env_file 은 compose 가 up 시점에 읽어 컨테이너 환경에
+      # 굽기 때문에 conf 를 고쳐도 반영하려면 재생성이 필요하다. 볼륨이면 앱이 기동할 때마다
+      # 파일을 다시 읽는다. (conf 반영 절차는 RUNBOOK.md 참고)
+      - ./config/nano-portal-api.conf:/app/.env:ro
+      # 로그는 호스트 관례대로 /var/log 아래 (같은 호스트의 다른 앱과 동일한 자리).
+      # 로그 수집 에이전트가 /var/log/** 를 감시하고, /var 를 별도 볼륨으로 떼기도 쉽다.
+      - /var/log/nano-portal-api:/app/logs
+      # 업로드는 로컬 볼륨에 둔다 — 저장 계층이 tmp→files 승격에 fs.rename() 을 쓰므로
+      # S3 FUSE 마운트(mountpoint-s3/s3fs)에 직접 얹으면 깨진다. (src/lib/storage/index.ts)
+      - ./upload:/app/uploads
+
+    # 공유 user-defined bridge. redis 등 형제 컨테이너에 이름 DNS 로 접속
+    # (conf 의 REDIS_URL=redis://srt_redis:6379 전제).
+    # external — 호스트 공통 자원이라 이 앱이 만들지 않는다. 없으면 compose 가 실패한다.
+    networks:
+      - srt_network
+
+    # 컨테이너 자기 파일시스템은 읽기 전용. 쓰기가 필요한 곳은 위 볼륨뿐이고
+    # 그 외 임시 쓰기는 tmpfs 로 흡수 → 앱 침해 시 이미지 변조 차단
+    # read_only: true
+    # tmpfs:
+    #   - /tmp
+
+    security_opt:
+      - no-new-privileges:true
+
+    # readiness(/v1/health/ready)로 판정 — DB·Redis 까지 확인한다.
+    # liveness(/v1/health)가 아니라 readiness 를 쓰는 이유: 도커는 unhealthy 라고 재시작하지 않으므로
+    # 이 값은 사람이 읽는 신호다. TCP 리슨만 보면 설정이 비어 DB 에 못 붙는 상태도 healthy 로 보인다.
+    # slim 이미지엔 curl 이 없어 node 로 호출한다.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get({host:'127.0.0.1',port:3001,path:'/v1/health/ready'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    # 앱이 파일 로그(winston-daily-rotate-file)를 따로 쓰므로 도커 json 로그는 소량만 보관
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  srt_network:
+    external: true
