@@ -1,0 +1,149 @@
+#   ==============  파이프라인 개요  ==============
+#   nano-portal-front — React(Vite) SPA 정적 배포
+#
+#   CI 와 CD 는 분리한다.
+#     CI : develop / master 브랜치 push, PR      → 검증만 (배포 없음)
+#     CD : X.Y.Z 태그 push                       → 배포
+#
+#   CD 는 태그 하나에서 DEV(자동) → PROD(수동 승격) 으로 이어진다.
+#     1) Deploy DEV   (자동)    — 태그 push 즉시
+#     2) Deploy PROD  (manual)  — Bitbucket UI 의 Run 버튼
+#
+#   ※ 백엔드의 "1 산출물 / 환경만 분리" 모델은 여기 적용되지 않는다.
+#     Vite 는 VITE_* 값을 빌드 시점에 번들로 구워버리므로 환경별로 다시 빌드해야 한다.
+#     따라서 각 배포 스텝이 자기 환경변수로 build 까지 수행한다. (태그는 여전히 하나)
+#
+#   ==============  필요한 변수  ==============
+#   [Repository variables]  — 환경 공통
+#     AWS_ACCESS_KEY_ID        (secured)   S3 PutObject + CloudFront CreateInvalidation 권한
+#     AWS_SECRET_ACCESS_KEY    (secured)
+#     AWS_DEFAULT_REGION                   ap-northeast-2
+#
+#   [Deployment variables]  — Repository settings > Deployments 의 development / production 에 각각
+#
+#     변수                      development                              production
+#     ----------------------- ---------------------------------------- ----------------------------------
+#     AWS_S3_BUCKET           s3-dev-nano-portal-front                 s3-prod-nano-portal-front
+#     AWS_CF_DISTRIBUTION_ID  E28W5BEAR2ENTS                           (미정 — apply 후 terraform output)
+#     VITE_API_BASE_URL       https://portal-api-dev.coffeezip.net     (미정 — prod API 도메인 확인 필요)
+#     VITE_MQTT_URL           (빈 값 허용 — 비우면 실시간 위젯 비활성)   (빈 값 허용)
+#
+#   ⚠️ VITE_* 는 전부 번들에 평문으로 구워져 브라우저에서 읽힌다. 시크릿을 넣지 말 것.
+#     (VITE_MQTT_PASSWORD 같은 건 Bitbucket 에서 secured 로 표시해도 번들에는 평문으로 실린다)
+#
+#   ==============  버킷 레이아웃  ==============
+#     s3-<env>-nano-portal-front/
+#     ├── app/             ← CloudFront origin_path. 서빙되는 유일한 영역
+#     └── build-version/   ← 태그별 빌드 zip. CloudFront 도달 불가(origin_path 밖)
+#
+#   ==============  인프라 상태  ==============
+#   S3/CloudFront/Route53 은 Terraform 이 관리한다:
+#     iac-terraform/infra/{dev,prod}/projects/nano-portal-front
+#
+#     DEV   apply 완료 (검증 통과)
+#             https://portal-dev.coffeezip.net
+#             S3 s3-dev-nano-portal-front / CF E28W5BEAR2ENTS
+#
+#     PROD  ⚠️ 아직 apply 전 — 버킷도 distribution 도 존재하지 않는다.
+#             PROD 스텝을 지금 Run 하면 실패한다.
+#             apply 후 terraform output 으로 위 표의 (미정) 두 칸을 채울 것.
+#             예정 도메인: https://portal.coffeezip.net
+#   =================================================
+image: node:22
+
+definitions:
+  steps:
+    # ── CI 공통 스텝 (YAML 앵커) ──
+    - step: &audit
+        name: CI - Security Audit
+        caches:
+          - node
+        script:
+          - npm ci                                 # 커밋된 package-lock.json 기준 재현 설치
+          - npm audit --audit-level=high || true   # 취약점 리포트 (비차단)
+
+    - step: &build
+        name: CI - Type Check & Build
+        caches:
+          - node
+        script:
+          - npm ci
+          - npm run build                          # tsc -b (타입체크) + vite build
+        artifacts:
+          - dist/**                                # 산출물 확인용. CD 는 자기 환경값으로 다시 빌드한다.
+
+pipelines:
+  # =============  CI: develop / master 브랜치 (머지 후)  =============
+  branches:
+    develop:
+      - parallel:
+          - step: *audit
+          - step: *build
+    master:
+      - parallel:
+          - step: *audit
+          - step: *build
+
+  # =============  CI: PR  =============
+  pull-requests:
+    '**':
+      - parallel:
+          - step: *audit
+          - step: *build
+
+  # =============  CD: 태그 기반 배포 (X.Y.Z)  =============
+  # X.Y.Z 태그를 push 하면 한 파이프라인 안에서:
+  #   1) DEV 배포   (자동)
+  #   2) PROD 배포  (manual — UI 에서 Run 클릭)
+  # 두 스텝은 같은 커밋에서 각자의 VITE_* 값으로 빌드해 각자의 버킷에 올린다.
+  tags:
+    '*.*.*':
+      - step:
+          name: Deploy to S3/CloudFront (DEV)
+          deployment: development
+          caches:
+            - node
+          script:
+            # 배포 절차는 DEV/PROD 동일 → 여기서 앵커 정의, PROD 는 alias 참조.
+            # (환경차는 deployment 에 묶인 변수 AWS_S3_BUCKET·AWS_CF_DISTRIBUTION_ID·VITE_* 뿐)
+            - &deploy_script |
+              set -e
+
+              # ── 1. 이 환경의 값으로 빌드 (VITE_* 는 여기서 번들에 구워진다) ──
+              npm ci
+              npm run build
+
+              # ── 2. AWS CLI + zip 준비 (node:22 에 둘 다 없음) ──
+              apt-get update -qq && apt-get install -y -qq awscli zip
+
+              # ── 3. 앱 업로드 (버킷의 app/ 하위 = CloudFront origin_path) ──
+              # 전 파일 no-cache. "캐시하지 마"가 아니라 "쓰기 전에 확인해" 라서
+              # CloudFront 엣지 캐시는 그대로 동작한다(x-cache: RefreshHit/Hit, Miss 아님).
+              # 브라우저만 매번 재검증(304) 하므로 배포가 즉시 반영되고 stale 이 남지 않는다.
+              # --delete 는 app/ 안으로만 적용되어 build-version/ 아카이브를 건드리지 않는다.
+              aws s3 sync dist "s3://${AWS_S3_BUCKET}/app/" --delete \
+                --cache-control "no-cache"
+
+              # ── 4. 빌드 아카이브 (같은 버킷의 build-version/, CloudFront 도달 불가) ──
+              # 재현이 불가능해진 상황(레지스트리 장애, 삭제된 패키지)에서의 보험이자
+              # "이 태그에 뭐가 나갔나" 를 한 덩어리로 남기는 기록.
+              # 롤백: unzip 후 위 sync 를 그대로 돌리면 된다(런북 참고).
+              zip -qr "${BITBUCKET_TAG}.zip" dist
+              aws s3 cp "${BITBUCKET_TAG}.zip" \
+                "s3://${AWS_S3_BUCKET}/build-version/${BITBUCKET_TAG}.zip"
+
+              # ── 5. 엣지 캐시 무효화 ──
+              # /* 는 파일 수와 무관하게 invalidation path 1개로 계산된다 (월 1,000 path 무료).
+              aws cloudfront create-invalidation \
+                --distribution-id "$AWS_CF_DISTRIBUTION_ID" \
+                --paths "/*"
+
+      # PROD 는 같은 커밋을 prod 환경변수로 다시 빌드해 manual 승격 배포 (UI 에서 Run 클릭).
+      - step:
+          name: Deploy to S3/CloudFront (PROD)
+          deployment: production
+          trigger: manual
+          caches:
+            - node
+          script:
+            - *deploy_script
