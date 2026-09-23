@@ -1,0 +1,198 @@
+image: atlassian/default-image:5
+
+# ─────────────────────────────────────────────────────────────
+# CD — 개발(dev) / 운영(prod) 완전 독립 파이프라인
+#   dev-*.*.*  태그 → dev/  를 S3 dev/templates  로 배포
+#   prod-*.*.* 태그 → prod/ 를 S3 prod/templates 로 배포
+# 두 환경은 서로 영향을 주지 않으며, 같은 버전을 dev에서 검증 후
+# prod 태그로 승격(promote)하는 흐름을 전제로 한다.
+# ─────────────────────────────────────────────────────────────
+
+definitions:
+  steps:
+    - step: &deploy-dev
+        name: dev Build & Upload
+        oidc: true
+        script:
+          - mkdir -p build-version
+          - apt update && apt install -y zip && rm -rf /var/lib/apt/lists/*
+          - zip -r build-version/$BITBUCKET_TAG.zip dev/
+          - pipe: atlassian/aws-s3-deploy:1.1.0
+            variables:
+              AWS_OIDC_ROLE_ARN: $AWS_ROLE_ARN
+              AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              S3_BUCKET: $S3_BUCKET_NAME/build-version
+              LOCAL_PATH: build-version
+          - pipe: atlassian/aws-s3-deploy:1.1.0
+            variables:
+              AWS_OIDC_ROLE_ARN: $AWS_ROLE_ARN
+              AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              S3_BUCKET: $S3_BUCKET_NAME/dev/templates
+              LOCAL_PATH: dev
+              # 오브젝트에 Cache-Control 을 명시한다. 미설정 시 브라우저가 휴리스틱 신선도
+              #   (now − Last-Modified) × 10% 를 쓰는데, 배포가 Last-Modified 를 갱신하므로
+              #   배포 직후 신선 기간이 ≈0초가 되어 매 로드가 조건부 요청(→304)이 된다.
+              #   304 에 CORS 헤더가 빠지는 현행 결함과 겹쳐 실사용자 CORS 장애로 이어진다.
+              #   ⚠️ 이것은 완화책이다. 근본 원인(캐시 키에 Origin 없음 + OriginOverride=false)은
+              #      인프라 조치로만 해소된다 — docs/cloudfront-cors-handover-v2.md §6
+              #   🔴 값에 공백을 넣지 말 것. pipe 1.1.0 의 pipe.sh 는
+              #        ARGS_STRING+="--$key=${AWS_S3_ARGS[$key]} "
+              #        run aws s3 sync ... ${ARGS_STRING[@]}
+              #      처럼 따옴표 없이 전개하므로, 'public, max-age=300' 은 공백에서 쪼개져
+              #      max-age=300 이 별도 위치 인자가 되고 s3 sync 가 실패한다(dev-1.2.12 에서 실제 발생).
+              CACHE_CONTROL: 'public,max-age=300'
+    - step: &invalidate-dev
+        name: dev CloudFront Invalidation
+        oidc: true
+        script:
+          - pipe: atlassian/aws-cloudfront-invalidate:0.6.0
+            variables:
+              AWS_OIDC_ROLE_ARN: $AWS_ROLE_ARN
+              AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              DISTRIBUTION_ID: $CF_DISTRIBUTION_ID
+              PATHS: "/dev/templates/*"
+    - step: &deploy-prod
+        name: prod Build & Upload
+        oidc: true
+        script:
+          - mkdir -p build-version
+          - apt update && apt install -y zip && rm -rf /var/lib/apt/lists/*
+          - zip -r build-version/$BITBUCKET_TAG.zip prod/
+          - pipe: atlassian/aws-s3-deploy:1.1.0
+            variables:
+              AWS_OIDC_ROLE_ARN: $AWS_ROLE_ARN
+              AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              S3_BUCKET: $S3_BUCKET_NAME/build-version
+              LOCAL_PATH: build-version
+          - pipe: atlassian/aws-s3-deploy:1.1.0
+            variables:
+              AWS_OIDC_ROLE_ARN: $AWS_ROLE_ARN
+              AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              S3_BUCKET: $S3_BUCKET_NAME/prod/templates
+              LOCAL_PATH: prod
+              # dev 와 동일 — 상세 주석은 &deploy-dev 참고 (값에 공백 금지)
+              CACHE_CONTROL: 'public,max-age=300'
+    - step: &invalidate-prod
+        name: prod CloudFront Invalidation
+        oidc: true
+        script:
+          - pipe: atlassian/aws-cloudfront-invalidate:0.6.0
+            variables:
+              AWS_OIDC_ROLE_ARN: $AWS_ROLE_ARN
+              AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              DISTRIBUTION_ID: $CF_DISTRIBUTION_ID
+              PATHS: "/prod/templates/*"
+
+    # ─────────────────────────────────────────────────────────────
+    # CORS 스모크 게이트 (post-deploy 검증 알람)
+    #   ⚠️ 이 step 은 "배포 차단"이 아니다 — deploy·invalidate 가 이미 끝난 뒤 실행되므로
+    #      자산은 이미 서빙 중이다. 실패 시 빨간 빌드 + 알람만 낸다.
+    #   dev/prod 가 동일 앵커 1개를 공유(트리거 태그로 환경 self-결정) → YAML 드리프트 차단.
+    #   근본책: docs/cloudfront-cors-handover-v2.md §6 (I-1 RHP 보정 → I-2 경로별 behavior 신설).
+    #   원인 분석·재현 기록: docs/cors-원인분석-20260807.md
+    #
+    #   ⚠️ 이 게이트가 원리적으로 할 수 '없는' 것 — 오해 방지를 위해 명시한다.
+    #      프로브는 매번 Origin 을 달고 요청하므로, 비어 있는 캐시 엔트리를 스스로 '정상'으로
+    #      채운다. 따라서 "지금 오염돼 있는가"는 답할 수 없다. 답할 수 있는 것은 두 가지다:
+    #        (1) 기전이 동작하는가 (200/304 양쪽에 CORS 헤더가 붙는가)
+    #        (2) 커스텀 RHP 가 붙어 있는가 ← 헤더출처 컬럼. 과거 실패 2회가 모두 '미부착'이었다.
+    #      최종 확인은 인프라 조치 후 '다음 배포 직후' 브라우저 일반 새로고침이다(강제 새로고침은
+    #      조건부 요청을 만들지 않아 의미 없음).
+    # ─────────────────────────────────────────────────────────────
+    - step: &cors-gate
+        name: CORS Smoke Gate
+        script:
+          - |
+            set -u
+            # MODE: warn(비차단) → hard(차단). 인프라 Response Headers Policy 가
+            #   /dev/templates/* 와 /prod/templates/* 두 behavior 에 OriginOverride=Yes 로 바인딩·검증된
+            #   '이후에만' 이 값을 hard 로 바꾼다(전용 커밋 + 근거 링크).
+            CORS_GATE_MODE="warn"
+
+            ORIGIN="https://cors-gate.smoke.invalid"   # 임의 교차 출처 — '*' 주입 증명용
+            ASSETS="NOTICE_CUSTOM INFO_CUSTOM NOTICE_STORE_STATUS EVENT_CUSTOM"
+            ATTEMPTS=5; SLEEP=10                        # 무효화 전파 지연 오탐 방지(상한 ≈40s)
+
+            command -v curl >/dev/null 2>&1 || { echo "FATAL: curl not found in build image"; exit 1; }
+            case "$BITBUCKET_TAG" in
+              dev-*)  ENVN=dev ;;
+              prod-*) ENVN=prod ;;
+              *) echo "FATAL: unexpected tag '$BITBUCKET_TAG'"; exit 1 ;;
+            esac
+            : "${ASSETS_BASE_URL:?FATAL: ASSETS_BASE_URL 변수 미설정 (예: https://<ASSETS_DOMAIN>)}"
+            BASE="${ASSETS_BASE_URL}/${ENVN}/templates"
+
+            # 헤더 이름이 줄 맨 앞에 올 때만 센다 — 'access-control-expose-headers: ETag, …' 처럼
+            #   값 문자열에 걸려 항상 통과하던 구버전의 false-pass 를 차단한다.
+            count_hdr() { printf '%s' "$1" | tr -d '\r' | grep -ic "^$2:"; }
+
+            probe() {  # asset  라벨  accept-encoding
+              local a="$1" L="$2" AE="$3" U="${BASE}/${a}.html"
+              local H R ET c200 c304 acao2 aceh2 acam2 acao3 aceh3 st src
+              if [ -n "$AE" ]; then H=$(curl -s -o /dev/null -D - -H "Origin: $ORIGIN" -H "Accept-Encoding: $AE" "$U")
+              else                  H=$(curl -s -o /dev/null -D - -H "Origin: $ORIGIN" "$U"); fi
+              c200=$(printf '%s' "$H" | grep -i '^HTTP/' | tr -d '\r' | cut -d' ' -f2)
+              ET=$(printf '%s' "$H" | grep -i '^etag:' | tr -d '\r' | cut -d' ' -f2)
+              acao2=$(count_hdr "$H" access-control-allow-origin)
+              aceh2=$(count_hdr "$H" access-control-expose-headers)
+              acam2=$(count_hdr "$H" access-control-allow-methods)
+
+              if [ -n "$AE" ]; then R=$(curl -s -o /dev/null -D - -H "Origin: $ORIGIN" -H "Accept-Encoding: $AE" -H "If-None-Match: $ET" "$U")
+              else                  R=$(curl -s -o /dev/null -D - -H "Origin: $ORIGIN" -H "If-None-Match: $ET" "$U"); fi
+              c304=$(printf '%s' "$R" | grep -i '^HTTP/' | tr -d '\r' | cut -d' ' -f2)
+              acao3=$(count_hdr "$R" access-control-allow-origin)
+              aceh3=$(count_hdr "$R" access-control-expose-headers)
+
+              st=OK
+              [ "$c200" = "200" ] || { st=FAIL; echo "    ! $a $L: 200 이 아님 ($c200)"; }
+              [ -n "$ET" ]        || { st=FAIL; echo "    ! $a $L: ETag 없음 → 조건부 요청 불가"; }
+              [ "$acao2" -eq 1 ]  || { st=FAIL; echo "    ! $a $L: 200 의 Allow-Origin 이 ${acao2}개 (1개여야 함)"; }
+              [ "$aceh2" -ge 1 ]  || { st=FAIL; echo "    ! $a $L: 200 에 Expose-Headers 없음 → JS 가 ETag 를 못 읽음"; }
+              [ "$c304" = "304" ] || { st=FAIL; echo "    ! $a $L: 조건부 요청이 304 가 아님 ($c304)"; }
+              [ "$acao3" -ge 1 ]  || { st=FAIL; echo "    ! $a $L: 304 에 Allow-Origin 없음 → 브라우저 CORS 차단"; }
+              [ "$st" = OK ] || fail=1
+
+              # 헤더를 누가 붙였는지. Allow-Methods/Max-Age 는 preflight 전용이라 커스텀 RHP 가
+              #   붙은 상태의 200 응답에는 나오지 않는다. 보인다면 그건 S3(오리진)가 붙인 것 = RHP 미부착.
+              src="RHP(엣지)"
+              [ "$acam2" -ge 1 ] && src="S3(오리진) — 커스텀 RHP 미부착"
+              printf "  %-20s %-11s 200:ACAO=%s,ACEH=%s  %s:ACAO=%s,ACEH=%s  %-4s  헤더출처=%s\n" \
+                "$a" "$L" "$acao2" "$aceh2" "$c304" "$acao3" "$aceh3" "$st" "$src"
+            }
+
+            attempt=1
+            while : ; do
+              fail=0
+              echo "── CORS gate (env=$ENVN, attempt=$attempt/$ATTEMPTS) ──"
+              # 캐시는 인코딩 변형별로 독립 오염된다. 브라우저가 실제로 받는 것은 br 이므로
+              #   무압축만 검사하던 구버전은 사용자가 쓰는 변형을 한 번도 보지 못했다.
+              for a in $ASSETS; do
+                probe "$a" "[identity]" ""
+                probe "$a" "[gzip]"     "gzip"
+                probe "$a" "[br]"       "gzip, deflate, br, zstd"
+              done
+              [ "$fail" -eq 0 ] && { echo "✅ CORS smoke gate PASSED (env=$ENVN)"; break; }
+              if [ "$attempt" -ge "$ATTEMPTS" ]; then
+                echo ""
+                echo "❌ CORS smoke gate FAILED (env=$ENVN, mode=$CORS_GATE_MODE)"
+                echo "   근본책: docs/cloudfront-cors-handover-v2.md §6 (I-1 RHP 보정 → I-2 경로별 behavior 신설)"
+                echo "   원인 분석·재현: docs/cors-원인분석-20260807.md"
+                echo "   ⚠️ 자산 ZIP 롤백으로는 안 고쳐진다 — CORS 는 파일 내용이 아니라 전송 헤더 문제다."
+                if [ "$CORS_GATE_MODE" = "hard" ]; then exit 1; fi
+                echo "⚠️  MODE=warn → 비차단(빌드 green 유지). 인프라 정책 적용·검증 후 hard 로 전환."
+                exit 0
+              fi
+              echo "  … retry in ${SLEEP}s (propagation tolerance)"
+              attempt=$((attempt + 1)); sleep "$SLEEP"
+            done
+
+pipelines:
+  tags:
+    "dev-*.*.*":
+      - step: *deploy-dev
+      - step: *invalidate-dev
+      - step: *cors-gate
+    "prod-*.*.*":
+      - step: *deploy-prod
+      - step: *invalidate-prod
+      - step: *cors-gate

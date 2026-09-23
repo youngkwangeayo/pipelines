@@ -1,0 +1,123 @@
+# ============================================
+# AWS ECR 배포용 Bitbucket Pipeline
+# ============================================
+# 필요한 환경변수 (Bitbucket Repository Settings > Pipelines > Repository variables):
+#   AWS_ROLE_ARN          - 빌릴 IAM 역할 (워크스페이스 변수 = 공용 역할)
+#   AWS_DEFAULT_REGION    - AWS 리전 (예: ap-northeast-2)
+#   AWS_ACCOUNT_ID        - AWS 계정 ID (예: <AWS_ACCOUNT_ID>)
+#
+# [Kubernetes (EKS) 배포 시 추가 필요]
+#   KUBE_CONFIG           - Base64 인코딩된 kubeconfig (cat ~/.kube/config | base64 -w 0)
+# ============================================
+
+image: atlassian/default-image:4
+
+definitions:
+  services:
+    docker:
+      memory: 3072
+
+pipelines:
+  # 태그 기반 배포 (v1.0.0, 1.0.0 등 semver 형식)
+  tags:
+    "*.*.*":
+      # ── Step 1: 빌드 검증 (tsc) — 의존성/타입 사전 점검
+      - step:
+          name: Build verification (tsc)
+          image: node:20-alpine
+          caches:
+            - node
+          script:
+            - npm ci
+            - npm run build
+
+      # ── Step 2: Docker 빌드 + AWS ECR 푸시
+      - step:
+          name: Build and Push to AWS ECR
+          oidc: true
+          deployment: production
+          services:
+            - docker
+          caches:
+            - docker
+          script:
+            # AWS CLI 설치 (non-interactive 모드)
+            - export DEBIAN_FRONTEND=noninteractive
+            - apt-get update && apt-get install -y awscli
+
+            # AWS CLI 버전 확인
+            - aws --version
+
+            # AWS 인증 설정
+            - export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/bb-oidc-token
+            - (umask 077; echo "$BITBUCKET_STEP_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE")
+            - aws sts get-caller-identity   # 어느 신분으로 도는지 로그에 남긴다
+
+            # ECR 로그인
+            - aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+
+            # Docker 이미지 빌드 (Dockerfile build args 주입)
+            - docker build
+              --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              --build-arg GIT_SHA="$(git rev-parse --short HEAD)"
+              --build-arg VERSION="$BITBUCKET_TAG"
+              -t $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG .
+
+            # Docker 이미지 태그 지정
+            - docker tag $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$BITBUCKET_REPO_SLUG:$BITBUCKET_TAG
+
+            # Docker 이미지 ECR에 푸시
+            - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$BITBUCKET_REPO_SLUG:$BITBUCKET_TAG
+
+            # latest 태그도 푸시
+            - docker tag $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$BITBUCKET_REPO_SLUG:latest
+            - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$BITBUCKET_REPO_SLUG:latest
+
+            # 배포 완료 메시지
+            - echo "Successfully pushed $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG to AWS ECR"
+
+      # ============================================
+      # Kubernetes 배포 (EKS)
+      # ============================================
+      # 사용하려면 아래 주석을 해제하세요.
+      # 사전 준비:
+      #   1. EKS 클러스터 생성 완료
+      #   2. kubeconfig를 Base64 인코딩하여 KUBE_CONFIG 환경변수에 저장
+      #      $ cat ~/.kube/config | base64 -w 0
+      #   3. K8s 시크릿 생성 완료 (ai-hub-dlv-secrets — DB / RabbitMQ 자격증명, TLS certs 등)
+      # ============================================
+      # - step:
+      #     name: Deploy to Kubernetes (EKS)
+      #     deployment: production
+      #     script:
+      #       # kubectl 설치
+      #       - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+      #       - chmod +x kubectl
+      #       - mv kubectl /usr/local/bin/
+      #
+      #       # kubeconfig 설정
+      #       - mkdir -p ~/.kube
+      #       - echo $KUBE_CONFIG | base64 -d > ~/.kube/config
+      #       - chmod 600 ~/.kube/config
+      #
+      #       # 클러스터 연결 확인
+      #       - kubectl cluster-info
+      #
+      #       # 이미지 태그 치환 (latest → 실제 버전)
+      #       - sed -i "s|ai-hub-dlv:latest|$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/ai-hub-dlv:$BITBUCKET_TAG|g" k8s/deployment.yaml
+      #
+      #       # Kubernetes 매니페스트 적용
+      #       - kubectl apply -f k8s/namespace.yaml
+      #       - kubectl apply -f k8s/configmap.yaml
+      #       - kubectl apply -f k8s/secret.yaml
+      #       - kubectl apply -f k8s/deployment.yaml
+      #       - kubectl apply -f k8s/service.yaml
+      #
+      #       # 롤아웃 상태 확인 (최대 5분 대기)
+      #       - kubectl rollout status deployment/ai-hub-dlv -n ai-hub-dlv --timeout=300s
+      #
+      #       # 배포 결과 확인
+      #       - kubectl get pods -n ai-hub-dlv
+      #       - kubectl get svc -n ai-hub-dlv
+      #
+      #       - echo "Successfully deployed to Kubernetes (EKS)"

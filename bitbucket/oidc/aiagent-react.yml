@@ -1,0 +1,149 @@
+#  ==============  레포지토리 환경 변수  ==============
+#   AWS_ROLE_ARN(워크스페이스 변수),  AWS_DEFAULT_REGION       # CLI
+#   AWS_ECR_REPO, AWS_ECR_NAME                                          # ECR 라이브
+#   K8S_REPO, K8S_API_TOKEN          GIT_EMAIL                          # K8S 라이브, 데브
+# =================================================
+#  내용
+# =================================================
+
+image: atlassian/default-image:5
+
+definitions:
+  services:
+    docker:
+      memory: 3072
+  steps:
+    # ── CI 공통 스텝 (YAML 앵커) ──
+    - step: &verify
+        name: CI - Verify (typecheck + lint + test)
+        image: node:22
+        caches:
+          - node
+        script:
+          - npm ci
+          - npm run verify
+    - step: &build
+        name: CI - Build
+        image: node:22
+        caches:
+          - node
+        script:
+          - npm ci
+          - npm run build
+        artifacts:
+          - dist/**
+    # ── e2e (Playwright, hermetic) — develop 게이트(phase-* PR)에서만 ──
+    - step: &e2e
+        name: CI - E2E (Playwright)
+        image: node:22
+        caches:
+          - node
+        script:
+          - npm ci
+          # 런타임 설정: 예제 복사(테스트는 page.route 로 API 목 → 값 무관)
+          - cp conf/config.json.example conf/config.json
+          # 브라우저 + OS 의존성 설치 (e2e:install = playwright install --with-deps chromium)
+          - npm run e2e:install
+          # playwright.config 의 webServer 가 npm run dev 자동 기동 후 테스트 실행
+          - npm run e2e
+        artifacts:
+          - playwright-report/**
+
+pipelines:
+  # =============  CI: 개발 검증 (develop push, PR)  =============
+  branches:
+    develop:
+      - parallel:
+          - step: *verify
+          - step: *build
+
+  pull-requests:
+    # develop 게이트: phase-* 브랜치 PR(= phase→develop)만 e2e 포함 (가장 구체적 매칭 우선)
+    "phase-*":
+      - parallel:
+          - step: *verify
+          - step: *build
+          - step: *e2e
+    # 그 외 모든 PR(spec PR 등): 단위 검증 + 빌드 (e2e 제외 — 느림)
+    "**":
+      - parallel:
+          - step: *verify
+          - step: *build
+
+  # =============  CD: 태그 기반 배포 (기존 유지)  =============
+  tags:
+    "dev-*.*.*":
+      - step:
+          name: Build and Push Docker Image to ECR
+          oidc: true
+          services:
+            - docker
+          script:
+            # buildx 끄기 (고전 빌더 사용)
+            - export DOCKER_BUILDKIT=0 ## atlassian/default-image:2인 경우엔 주석
+
+            # dev- 프리픽스 제거
+            - export BITBUCKET_TAG=${BITBUCKET_TAG#dev-}
+
+            - LOCAL_IMAGE=$BITBUCKET_REPO_SLUG:$BITBUCKET_TAG
+
+            # 버전 정보 파일 생성
+            - echo "{\"version\":\"$BITBUCKET_TAG\"}" > version.json
+
+            # Docker 이미지 빌드 (버전 정보 주입)
+            - docker build --build-arg APP_VERSION=$BITBUCKET_TAG -t $LOCAL_IMAGE .
+            - docker tag $LOCAL_IMAGE $BITBUCKET_REPO_SLUG:latest
+
+            # ECR 로그인 및 이미지 푸
+            - pipe: atlassian/aws-ecr-push-image:2.6.0
+              variables:
+                AWS_OIDC_ROLE_ARN: $AWS_ROLE_ARN
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                IMAGE_NAME: $BITBUCKET_REPO_SLUG
+                TAGS: "$BITBUCKET_TAG latest"
+      - step:
+          name: K8S REPO PUSH
+          script:
+            # dev- 프리픽스 제거
+            - export BITBUCKET_TAG=${BITBUCKET_TAG#dev-}
+
+            - git config --global user.email "$GIT_EMAIL"
+            - git config --global user.name "Bitbucket Pipeline"
+            - git clone https://x-token-auth:$K8S_API_TOKEN@bitbucket.org/$K8S_REPO.git k8s-dir
+            - cd k8s-dir
+
+            - sed -i "s/^\(\s*tag:\s*\).*/\1${BITBUCKET_TAG}/" ./helm-charts/aiagent/aiagent-react/values-dev.yaml
+
+            - git add .
+            - 'git commit -m "chore: update aiagent-react dev image tag to $BITBUCKET_TAG"'
+            - |
+              n=0
+              until [ "$n" -ge 10 ]
+              do
+                git pull --rebase origin main && git push origin main && break
+                n=$((n+1))
+                echo "Push failed. Retrying in 3 seconds... (Attempt $n)"
+                sleep 1
+              done
+    "*.*.*":
+      - step:
+          name: K8S REPO PUSH
+          script:
+            - git config --global user.email "$GIT_EMAIL"
+            - git config --global user.name "Bitbucket Pipeline"
+            - git clone https://x-token-auth:$K8S_API_TOKEN@bitbucket.org/$K8S_REPO.git k8s-dir
+            - cd k8s-dir
+
+            - sed -i "s/^\(\s*tag:\s*\).*/\1${BITBUCKET_TAG}/" ./helm-charts/aiagent/aiagent-react/values-prod.yaml
+
+            - git add .
+            - 'git commit -m "chore: update aiagent-react dev image tag to $BITBUCKET_TAG"'
+            - |
+              n=0
+              until [ "$n" -ge 10 ]
+              do
+                git pull --rebase origin main && git push origin main && break
+                n=$((n+1))
+                echo "Push failed. Retrying in 3 seconds... (Attempt $n)"
+                sleep 1
+              done

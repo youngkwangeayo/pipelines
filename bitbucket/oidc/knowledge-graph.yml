@@ -1,0 +1,102 @@
+# ============================================
+# AWS ECR + NCP Container Registry 통합 배포용 Bitbucket Pipeline
+# ============================================
+# 사용 방법: 이 파일을 bitbucket-pipelines.yml로 복사하여 사용
+#
+# 필요한 환경변수 (Bitbucket Repository Settings > Pipelines > Repository variables):
+#
+#   [AWS]
+#   AWS_ROLE_ARN          - 빌릴 IAM 역할 (워크스페이스 변수 = 공용 역할)
+#   AWS_DEFAULT_REGION    - AWS 리전 (예: ap-northeast-2)
+#   AWS_ACCOUNT_ID        - AWS 계정 ID (예: <AWS_ACCOUNT_ID>)
+#
+#   [NCP]
+#   NCP_ACCESS_KEY - NCP API 액세스 키 (마이페이지 > 계정관리 > 인증키 관리)
+#   NCP_SECRET_KEY - NCP API 시크릿 키
+#   NCP_REGISTRY   - NCP Container Registry URL (예: my-registry.kr.ncr.ntruss.com)
+# ============================================
+
+image: atlassian/default-image:4
+
+definitions:
+  services:
+    docker:
+      memory: 3072
+
+pipelines:
+  # 태그 기반 배포 (v1.0.0, 1.0.0 등 semver 형식)
+  tags:
+    "*.*.*":
+      # Step 1: Docker 이미지 빌드
+      - step:
+          name: Build Docker Image
+          services:
+            - docker
+          caches:
+            - docker
+          script:
+            # Docker 이미지 빌드
+            - docker build -t $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG .
+
+            # 빌드된 이미지를 파일로 저장 (다음 단계에서 사용)
+            - docker save $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG -o image.tar
+          artifacts:
+            - image.tar
+
+      # Step 2: AWS ECR과 NCP Registry에 병렬 푸시
+      - parallel:
+          # AWS ECR 배포
+          - step:
+              name: Push to AWS ECR
+              oidc: true
+              services:
+                - docker
+              script:
+                # AWS CLI 설치 (non-interactive 모드)
+                - export DEBIAN_FRONTEND=noninteractive
+                - apt-get update && apt-get install -y awscli
+
+                # 저장된 이미지 로드
+                - docker load -i image.tar
+
+                # AWS 인증 설정
+                - export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/bb-oidc-token
+                - (umask 077; echo "$BITBUCKET_STEP_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE")
+                - aws sts get-caller-identity   # 어느 신분으로 도는지 로그에 남긴다
+
+                # ECR 로그인
+                - aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+
+                # Docker 이미지 태그 지정 및 푸시
+                - docker tag $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$BITBUCKET_REPO_SLUG:$BITBUCKET_TAG
+                - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$BITBUCKET_REPO_SLUG:$BITBUCKET_TAG
+
+                # latest 태그도 푸시
+                - docker tag $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$BITBUCKET_REPO_SLUG:latest
+                - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$BITBUCKET_REPO_SLUG:latest
+
+                # 배포 완료 메시지
+                - echo "✅ Successfully pushed $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG to AWS ECR"
+
+          # NCP Container Registry 배포
+          - step:
+              name: Push to NCP Container Registry
+              services:
+                - docker
+              script:
+                # 저장된 이미지 로드
+                - docker load -i image.tar
+
+                # NCP Container Registry 로그인
+                - docker login $NCP_REGISTRY -u $NCP_ACCESS_KEY -p $NCP_SECRET_KEY
+
+                # Docker 이미지 태그 지정 및 푸시
+                - docker tag $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG $NCP_REGISTRY/$BITBUCKET_REPO_SLUG:$BITBUCKET_TAG
+                - docker push $NCP_REGISTRY/$BITBUCKET_REPO_SLUG:$BITBUCKET_TAG
+
+                # latest 태그도 푸시
+                - docker tag $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG $NCP_REGISTRY/$BITBUCKET_REPO_SLUG:latest
+                - docker push $NCP_REGISTRY/$BITBUCKET_REPO_SLUG:latest
+
+                # 배포 완료 메시지
+                - echo "✅ Successfully pushed $BITBUCKET_REPO_SLUG:$BITBUCKET_TAG to NCP Container Registry"
